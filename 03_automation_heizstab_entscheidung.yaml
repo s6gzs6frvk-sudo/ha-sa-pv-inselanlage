@@ -1,0 +1,317 @@
+# =============================================================================
+# Ebene B — Heizstab ENTSCHEIDUNG (kein switch.turn_on/off)
+# =============================================================================
+# Berechnet nur input_number.heizstab_soll_stufe. 04 (Aktorik) schaltet die Relais.
+# PV-Aus: nur bei Nachtsperre aktiv (1 h PV <= 50 W), Notlauf ausgenommen.
+# SOC max: < 45 % = 0, 45–64 % = 2, >= 65 % = 3 Stäbe möglich.
+#
+# NOTLAUF-REGEL (28.09.2026, Bruder-Regel + Blackout-Vorfall 26./27.09.):
+# - Am Netz: Rampe 1 Stab pro Heartbeat bis 3 (08 uebernimmt per Phase, sobald Netzbezug > 500 W).
+# - Aus dem Akku: GENAU 2 Staebe (1 Stab bringt am 1000-L-Kessel nichts, 3 kippen den Akku),
+#   solange Akkuspannung >= 51.2 V und SOC >= 30 %. Darunter 0 Staebe aus dem Akku, Wiederanlauf
+#   erst ab 52.5 V und 40 % (Hysterese). 51.2 V liegt knapp ueber F2-05 (51.0 V), dem Punkt, an dem
+#   der WR selbst aufs Netz geht: HA hoert dort auf, das Netz uebernimmt. Ohne Netz bleibt die
+#   Hausreserve. Spannung ist Hauptkriterium, weil der SA-SOC unten unzuverlaessig ist (17 % bei
+#   48.8 V am 27.09.). Ersetzt den alten 15-%-Boden und die 1-Stab-Stufe (emergency_lvl_1).
+# - Hochrampen NUR beim Heartbeat oder beim Notlauf-Start. Vorher loeste JEDER Trigger im Notlauf
+#   ein Hochschalten aus, auch bat_low (Step-DOWN-Trigger!) -> 26./27.09.: Soll 0 -> 3 in 33 s.
+# - on_grid = binary_sensor.netzbetrieb_aktiv (00: WR-Modus "Grid" ODER > 500 W), weil der reine
+#   Netzbezug bei Grundlast nur ~290 W betraegt (CSV 28.09.) und der Netz-Notlauf sonst bei
+#   0 Staeben nie startet. Der 500-W-Wert (Bruder) bleibt als Fallback erhalten.
+# - PV-Hochschalten NUR im Akkubetrieb (not on_grid): im Netzbetrieb speist PV nur den Akku, ein
+#   Stab zoege aus dem Netz -> grid_high-Sperre im 12-min-Takt (s. Kommentar im action_type).
+# - AUDIT 28.09. abends: Heartbeat schaltet bei SOC <= 65 % auch dann runter, wenn der Akku anhaltend
+#   entlaedt (nicht nur bei PV <= 120 W). Schliesst die Luecke, dass bat_low als Flanken-Trigger nach
+#   einem Step-down nicht erneut feuert und ein Stab bei mittlerer PV aus dem Akku weiterlief.
+
+alias: "Heizstab Entscheidung"
+description: "PV/Notlauf/SOC — schreibt nur Heizstab Soll-Stufe (0–3)."
+triggers:
+  - trigger: time_pattern
+    minutes: /2
+    id: heartbeat
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sichere_batterie_leistung') | float(-99999) < -900
+      and states('sensor.sichere_batterie_leistung') | float(-99999) != -99999 }}
+    for: "00:00:30"
+    id: bat_low
+  # 9-kW-Akkuschutz: sanftes Runterschalten bevor der harte bat_9kw_hard (02) greift.
+  # FIX (Juni 2026): Schwelle -8800->-8200, Fenster 3s->2s. Grund: bat_9kw_hard
+  # feuert bei -9000 schon nach 2s. Mit -8800/3s wurde der sanfte Step-down bei
+  # einem schnellen Einbruch vom harten Cut ueberholt (3s > 2s) und das alte Band
+  # -8800..-8999 war nur 200 W breit. Mit -8200/2s liegt der sanfte Schutz im Band
+  # -8200..-8999 (dort kann bat_9kw_hard nicht feuern) -> ein Stab runter statt
+  # Hart-Aus + Sperre. Nur ein echter Slam ueber -9000 geht weiter hart aus.
+  # Nebeneffekt (gewollt): aus reinem Akku bleiben so stabil 2 Staebe (~5,7 kW),
+  # der 3. nur wenn PV mittraegt (3 Staebe aus Akku ~ -8,6 kW < -8200 -> Step-down).
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sichere_batterie_leistung') | float(-99999) <= -8200
+      and states('sensor.sichere_batterie_leistung') | float(-99999) != -99999 }}
+    for: "00:00:02"
+    id: bat_protect
+  # (28.09.2026: der fruehere pv_low-Trigger ist entfallen — der Heartbeat prueft dieselbe Bedingung
+  #  "PV <= 120 W und SOC <= 65 %" ohnehin alle 2 min, s. action_type.)
+  # FIX (4. Runde, 26.06.2026): Nacht-Erkennung von gemessener PV-Leistung auf MPPT-SPANNUNG.
+  # Frueher PV <= 50 W / 1 h -> konnte bei vollem Akku + leerem Boiler mittags faelschlich
+  # anspringen (abgeregelte Leistung liest niedrig). Jetzt mppt_v < 100 V / 30 min = echte Nacht.
+  # Bildet mit night_lock_off (mppt_v > 200) ein Hysterese-Band: < 100 = Nacht an, > 200 = aus,
+  # 100-200 = totes Band (die Spannung transitiert da nur kurz durch, s. Chart-Daten).
+  # ROBUSTHEIT (26.06.): Nacht NUR wenn MPPT < 100 V UND gemessene PV < 50 W. Verhindert, dass
+  # ein zickender/falscher MPPT-Sensor (liest 0) mitten am Tag faelschlich Nacht erkennt und die
+  # Nachtsperre setzt -> blockierte das ganze Heizen. Bei echter Nacht sind BEIDE niedrig.
+  # Defaults float(999) -> unlesbarer Sensor zaehlt NICHT als Nacht (konservativ: nicht sperren).
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sichere_mppt_spannung') | float(999) < 100
+      and states('sensor.sichere_pv_leistung') | float(999) < 50 }}
+    for: "00:30:00"
+    id: night_lock_on
+  # FIX (Juni 2026): Nachtsperre loest jetzt auch bei abgeregelter PV — sonst bleibt sie
+  # bei Zero-Export haengen, weil die abgeregelte PV-Leistung im Morgengrauen/bei vollem
+  # Akku nie > 120 W erreicht.
+  # UPDATE (4. Runde, 26.06.2026): zweiter Zweig von SOC auf MPPT-SPANNUNG umgestellt.
+  # Grund: SOC-Deckel wandert (75-83 %) wegen unbalancierter Akku-Straenge -> SOC-Proxy
+  # unzuverlaessig. mppt_v > 200 = "Sonne da" gemessen (Tag ~400 V, Nacht ~25 V).
+  # PARITAET (26.06.): zweiter Zweig jetzt IDENTISCH zum zero_export_bootstrap_ok in 00 =
+  # "mppt_v > 200 UND Akku entlaedt nicht anhaltend" (binary_sensor.akku_entladung_anhaltend).
+  # Frueher stand hier das MOMENTAN-"bat > -100" -> flackerte und war nicht mehr deckungsgleich
+  # mit dem 00-Bootstrap. Jetzt beide ueber DENSELBEN Sensor -> kein Auseinanderlaufen mehr.
+  - trigger: template
+    value_template: >-
+      {{ (
+           states('sensor.sichere_pv_leistung') | float(0) > 120
+           and states('sensor.sichere_pv_leistung') | float(0) != -99999
+         ) or (
+           states('sensor.sichere_mppt_spannung') | float(0) > 200
+           and states('sensor.sichere_batterie_leistung') | float(-99999) != -99999
+           and not is_state('binary_sensor.akku_entladung_anhaltend', 'on')
+         ) }}
+    for: "00:05:00"
+    id: night_lock_off
+  - trigger: state
+    entity_id: binary_sensor.heizstab_notlauf_aktiv
+  - trigger: state
+    entity_id: input_boolean.heizstab_nachtsperre
+    to: "off"
+    id: nachtsperre_aus
+  - trigger: state
+    entity_id: input_boolean.heizstab_sicherheits_sperre
+    to: "off"
+variables:
+  soc: "{{ states('sensor.sicherer_batterie_soc') | float(0) }}"
+  bat_p: "{{ states('sensor.sichere_batterie_leistung') | float(-99999) }}"
+  pv_p: "{{ states('sensor.sichere_pv_leistung') | float(-99999) }}"
+  grid_p: "{{ states('sensor.sichere_netz_leistung') | float(99999) }}"
+  # Akkuspannung = MINIMUM der drei WR-Messungen (SA liefert bei dieser Anlage KEIN
+  # sensor.solarassistant_battery_voltage, nur inverter_X_battery_voltage; CSV 28.09.). Minimum,
+  # weil der WR mit der niedrigsten Messung zuerst aufs Netz geht. Unlesbare Sensoren zaehlen
+  # nicht; sind ALLE unlesbar -> 99 (= "Spannung ok"): der SA-Komplettausfall wird schon ueber den
+  # Akku-Sentinel (-99999 -> zwang_aus in 02) abgefangen, ein Default 0 wuerde das Akku-Heizen
+  # bei einem Namensfehler STILL abschalten. Der SOC bleibt als zweites Kriterium erhalten.
+  bat_v: >-
+    {% set ns = namespace(v=[]) %}
+    {% for e in ['sensor.solarassistant_inverter_1_battery_voltage',
+                 'sensor.solarassistant_inverter_2_battery_voltage',
+                 'sensor.solarassistant_inverter_3_battery_voltage'] %}
+      {% set x = states(e) | float(-1) %}
+      {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+    {% endfor %}
+    {{ (ns.v | min) if (ns.v | count) > 0 else 99 }}
+  # "Auf Netz?" — EIN Kriterium fuer alle Automationen (seit 28.09. abends): binary_sensor.netzbetrieb_aktiv
+  # aus 00 (WR-Modus exakt "Grid" ODER Netzbezug > 500 W mit Hysterese) plus der alte 500-W-Weg als
+  # Fallback, falls 00 mal nicht geladen ist. Identisch in 04/08/09 und im zwang_aus.
+  # 99999 = Sentinel -> NICHT als Netzbetrieb werten.
+  on_grid: >-
+    {{ is_state('binary_sensor.netzbetrieb_aktiv', 'on')
+       or (grid_p > 500 and grid_p != 99999) }}
+  # ROOT-FIX (26.06., aus Logbuch belegt): current_level = SOLL, nicht effektive_stufe.
+  # Die effektive Stufe (aus Shelly-Watt > 200 W) flackert/laggt beim Schalten ("Relais an,
+  # keine Leistung") -> step_up rechnete von 0 -> Soll sprang schlagartig 3->1, 3->2 trotz Sonne.
+  # Soll ist die eigene, stabile Stell-Groesse -> sauberes Hochrampen, kein Sensor-Rausch-Pendeln.
+  # "Boiler voll" faengt die TEMPERATUR ab (oben >= 76 kein Hochschalten, >= 79 Aus), nicht die
+  # Watt-Messung. effektive_stufe bleibt nur fuer den Status-Text (Diagnose).
+  current_level: "{{ states('input_number.heizstab_soll_stufe') | int(0) }}"
+  max_level: "{{ states('sensor.heizstab_max_stufe_pv') | int(0) }}"
+  emergency_active: "{{ is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') }}"
+  step_up_ok: "{{ is_state('binary_sensor.heizstab_hochschalten_erlaubt', 'on') }}"
+  # COOLDOWN (5. Runde, 26.06.2026): nach einem HARTEN Akku-/Netz-Abwurf (bat_protect in 03,
+  # bat_9kw_hard / grid_high / grid_slam in 02) fuer 10 min kein erneutes Hochschalten UND kein
+  # Notlauf-Hochrampen -> bricht die Retry-Flicker-Schleife bei fehlendem Budget (z.B. Notlauf +
+  # 3 Backoefen aus Akku, oder Heizstaebe beim Batterie->Netz-Wechsel auf schwacher Phase).
+  # bat_low (milde Wolke) loest den Cooldown NICHT aus -> Solar bleibt reaktionsschnell.
+  # Default TRUE wenn Helfer fehlt (= Cooldown praktisch aus, kein Schaden).
+  cooldown_ok: >-
+    {{ (as_timestamp(now())
+        - as_timestamp(states('input_datetime.letzter_heizstab_abwurf'), 0)) > 600 }}
+  # HOLD nach Step-down (27.06., aus Live-Logbuch belegt): nach einem SANFTEN Runterschalten
+  # (bat_low/pv_low/Heartbeat-PV-Aus) fuer ~5 min KEIN erneutes PV-Hochschalten. Bricht das
+  # Antast-Pendeln am Ueberschuss-Limit (2<->3 nachmittags, 0<->1 morgens/abends) — im Logbuch
+  # ~316 schnelle Wechsel/Tag. Gilt NUR fuers PV-step_up; emergency_step_up bleibt frei (Notlauf
+  # reaktiv). Step-DOWN bleibt jederzeit moeglich. Default TRUE wenn Helfer fehlt. 300 s tunbar.
+  hold_ok: >-
+    {{ (as_timestamp(now())
+        - as_timestamp(states('input_datetime.letzter_pv_step_down'), 0)) > 300 }}
+  # FIX (3.7.2026, PDF-Befund verifiziert): "False" GROSS schreiben. HA wandelt Template-
+  # Variablen per literal_eval in native Typen — kleines "false" scheitert daran, bleibt
+  # STRING und ist damit truthy (gleiche Fehlerklasse wie der #-Kommentar-Bug). Heute nur
+  # maskiert, weil das Soll in den betroffenen Momenten eh 0 ist; bei manuellem Nachtsperre-
+  # Aus am Tag haette es das Soll faelschlich auf 0 gesetzt.
+  pv_aus_aktiv: >-
+    {% if trigger.id in ['night_lock_off', 'nachtsperre_aus'] %}False
+    {% else %}
+      {{ is_state('input_boolean.heizstab_nachtsperre', 'on')
+         or trigger.id == 'night_lock_on' }}
+    {% endif %}
+  action_type: >
+    {% if is_state('input_boolean.heizstab_sicherheits_sperre', 'on')
+       or is_state('input_boolean.heizstab_watchdog_sperre', 'on') %}
+      skip
+    {% elif bat_p <= -8200 and bat_p != -99999 %}
+      step_down
+    {% elif emergency_active %}
+       {# AKKU-BODEN (28.09.2026, ersetzt den 15-%-Boden vom 3.7.): ohne Netz stoppt das Heizen
+          KOMPLETT unter 51.2 V oder 30 % SOC; Wiederanlauf erst ab 52.5 V UND 40 % (Hysterese,
+          die Spannung erholt sich nach Lastabwurf um ~1 V). MUSS als ERSTES stehen (vor Cooldown-/
+          Netz-keep). Sentinel: SOC-Sensor tot -> 0 % -> Stopp. Am Netz gilt der Boden NICHT,
+          dort heizt 08 per Phase. #}
+       {% if not on_grid and (bat_v < 51.2 or soc < 30
+                              or (current_level == 0 and (bat_v < 52.5 or soc < 40))) %} emergency_soc_stop
+       {% elif not cooldown_ok %} keep
+       {% elif not is_state('binary_sensor.netzspannung_stabil', 'on') %} keep
+       {# AUS DEM AKKU: genau 2 Staebe, sofort (kein Durchlaufen der sinnlosen 1-Stab-Stufe),
+          nie 3 (3 Staebe ~ -8.6 kW -> bat_protect). Steht schon 2, bleibt 2. #}
+       {% elif not on_grid %} emergency_bat_2
+       {# AM NETZ: sanfte Rampe, aber NUR beim Heartbeat oder Notlauf-Start. Alle anderen
+          Trigger (bat_low, night_lock_*, Sperre aus ...) halten das Soll. #}
+       {% elif trigger.id | default('', true) == 'heartbeat'
+             or trigger.entity_id | default('', true) == 'binary_sensor.heizstab_notlauf_aktiv' %} emergency_step_up
+       {% else %} keep {% endif %}
+    {% elif pv_aus_aktiv %} pv_aus
+    {% else %}
+       {# NOTLAUF-ENDE AM NETZ (3.7.2026, PDF-Befund H2 verifiziert): endet der Notlauf,
+          waehrend die Staebe aus dem Netz heizen (grid > 500), schaltete frueher niemand ab —
+          Soll blieb 3, 04 hielt die Relais, nach 15 s feuerte grid_high -> Sperre + 10-min-
+          Cooldown. Ein NORMALER Uebergang endete systematisch im Sicherheits-Event. Jetzt:
+          beim Notlauf-Ende-Trigger mit Netzbezug sofort alles aus (vor grid_highs 15 s);
+          ist Sonne da, holt step_up das Soll binnen 2 min regulaer zurueck. #}
+       {% if trigger.entity_id | default('', true) == 'binary_sensor.heizstab_notlauf_aktiv'
+            and on_grid %} pv_aus
+       {% elif trigger.id == 'bat_low' %} step_down
+       {# HEARTBEAT-STEP-DOWN (Audit 28.09.2026 abends): bei SOC <= 65 % ein Stab runter, wenn PV weg ist
+          (<= 120 W, wie bisher) ODER der Akku ANHALTEND entlaedt (akku_entladung_anhaltend = laenger als
+          40 s unter -300 W). Grund: bat_low ist ein Flanken-Trigger und feuert nur beim Uebergang auf
+          < -900 W. Blieb nach dem Step-down immer noch ein Stab zu viel (z. B. PV 500 W, Stab 2,7 kW ->
+          Akku -2,5 kW), kam keine neue Flanke -> der Stab lief aus dem Akku, bis der SOC unter 45 % fiel.
+          Ueber 65 % bleibt das gewollte PV-Waermespeicher-Verhalten (Akku darf in den Kessel, die
+          Nachtsperre beendet es). #}
+       {% elif trigger.id == 'heartbeat' and soc <= 65
+            and ((pv_p <= 120 and pv_p != -99999)
+                 or (is_state('binary_sensor.akku_entladung_anhaltend', 'on') and current_level > 0)) %} step_down
+       {# KEIN PV-HOCHSCHALTEN AM NETZ (28.09.2026): Im Netzbetrieb (SBU nach 49.0 V, morgens bis
+          F2-06 = 53.0 V) speist PV bei diesem WR NUR den Akku, die Lasten haengen am Netz (CSV 28.09.:
+          Netz 7.2 kW = Last 7.1 kW bei 3-5 kW PV). Ein PV-Stab wuerde also aus dem Netz heizen
+          -> grid_high (02) -> Sperre + 10-min-Cooldown, alle ~12 min von vorn. Am Netz erst
+          den Akku laden (macht der WR von selbst), heizen erst wieder im Akkubetrieb. #}
+       {% elif on_grid %} keep
+       {% elif step_up_ok and cooldown_ok and hold_ok %} step_up
+       {% else %} keep
+       {% endif %}
+    {% endif %}
+  target_level_raw: >
+    {% if action_type == 'skip' %}
+      {{ states('input_number.heizstab_soll_stufe') | int(0) }}
+    {% elif action_type == 'pv_aus' %} 0
+    {% elif action_type == 'emergency_soc_stop' %} 0
+    {% elif action_type == 'emergency_bat_2' %} 2
+    {% elif action_type == 'emergency_step_up' %}
+      {{ current_level + 1 if current_level < 3 else 3 }}
+    {% elif action_type == 'step_down' %}
+      {{ current_level - 1 if current_level > 0 else 0 }}
+    {% elif action_type == 'step_up' %}
+      {{ current_level + 1 if current_level < max_level | int else max_level | int }}
+    {% else %} {{ current_level }} {% endif %}
+  target_level: >
+    {% set raw = target_level_raw | int %}
+    {% if action_type in ['emergency_bat_2', 'emergency_step_up']
+       or action_type == 'skip' or emergency_active %}
+      {{ raw }}
+    {% else %}
+      {{ [raw, max_level | int] | min }}
+    {% endif %}
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: night_lock_on
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.heizstab_nachtsperre
+      - conditions:
+          - condition: trigger
+            id: night_lock_off
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.heizstab_nachtsperre
+      # SELBST-HEILUNG (26.06.): falls die Nachtsperre je faelschlich am Tag haengt, beim
+      # Heartbeat aufloesen, sobald klar Tag ist (PV > 120 ODER MPPT > 200). night_lock_off
+      # feuert sonst nur beim Uebergang, nicht im Dauerzustand -> haette stecken bleiben koennen.
+      - conditions:
+          - condition: trigger
+            id: heartbeat
+          - condition: state
+            entity_id: input_boolean.heizstab_nachtsperre
+            state: "on"
+          - condition: template
+            value_template: >-
+              {{ (pv_p > 120 and pv_p != -99999)
+                 or states('sensor.sichere_mppt_spannung') | float(0) > 200 }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.heizstab_nachtsperre
+  - condition: template
+    value_template: "{{ action_type != 'skip' }}"
+  - action: input_number.set_value
+    target:
+      entity_id: input_number.heizstab_soll_stufe
+    data:
+      value: "{{ target_level | int }}"
+  # Bei HARTEM Akku-Abwurf (bat_protect) den Cooldown-Zeitstempel setzen -> 10 min keine
+  # Wieder-Anlauf-Versuche. bat_low (mild) absichtlich NICHT, damit Solar reaktiv bleibt.
+  - if:
+      - condition: template
+        value_template: "{{ bat_p <= -8200 and bat_p != -99999 }}"
+    then:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.letzter_heizstab_abwurf
+        data:
+          timestamp: "{{ as_timestamp(now()) }}"
+  # ANTI-PENDEL-HOLD: bei jedem echten (sanften) Step-down den Hold-Zeitstempel setzen ->
+  # 5 min kein Re-Antasten (s. hold_ok). Nur wenn wirklich ein Stab runter geht (current_level > 0).
+  # ADAPTIV (28.09.2026, aus der CSV 15:00-16:45: 24 Soll-Wechsel in 100 min, Staebe teils nur 1-2 min
+  # an): War der letzte Stab KUERZER als 4 min an, bevor er wieder runter musste (= Fehlversuch, das
+  # PV-Limit ist gefunden), wird der Stempel 15 min in die Zukunft gesetzt -> Hold 20 min statt 5.
+  # Lief der Stab laenger, bleibt der Hold bei 5 min (echte Wolke/Abendlicht, schnell wieder antasten).
+  # Kein neuer Helfer: die Laufzeit kommt aus last_changed der Soll-Stufe (letzte Aenderung = das
+  # Hochschalten). Die SA-PV-Prognose wurde dafuer verworfen: am 28.09. lag sie nachmittags 30-40 %
+  # UNTER der Messung (15:00 Prognose 8,0 kW, real 12,0; 16:00 5,3 vs 9,1) und gegen Abend DARUEBER
+  # (16:46 3,2 vs 1,8) -> als Deckel wuerde sie an sonnigen Tagen PV verschenken.
+  - if:
+      - condition: template
+        value_template: "{{ action_type == 'step_down' and (current_level | int) > 0 }}"
+    then:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.letzter_pv_step_down
+        data:
+          timestamp: >-
+            {% set s = states.input_number.heizstab_soll_stufe %}
+            {% set kurz = s is not none and (now() - s.last_changed).total_seconds() < 240 %}
+            {{ as_timestamp(now()) + (900 if kurz else 0) }}
+mode: queued
+max: 5

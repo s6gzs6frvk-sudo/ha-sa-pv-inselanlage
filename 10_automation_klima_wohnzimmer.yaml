@@ -1,0 +1,142 @@
+# =============================================================================
+# KLIMA WOHNZIMMER 2S ALS WAERMEPUMPE (28.09.2026, erste Fassung — NACH DEM EINSPIELEN
+# ZUNAECHST DEAKTIVIERT LASSEN und im Herbst bei Anwesenheit beobachten)
+# =============================================================================
+# climate.klima_wohnzimmer (Wohnzimmer 2. Stock): hvac_modes off/heat/cool/heat_cool/dry/fan_only,
+# min_temp 16 (!), Leistung unbekannt (Annahme 1-1,5 kW elektrisch). Im Heizmodus macht sie aus
+# 1 kWh Strom ~3 kWh Waerme, ein Heizstab 1 kWh -> sie soll vor den Staeben drankommen.
+#
+# REGELN
+# HEIZEN, wenn der Raum unter Soll liegt (Soll 21 bei Besuch 2S/Abfuhr, sonst 16 = Geraeteminimum;
+#   das Leerstand-Soll 12 kann die Klima nicht, sie haelt dann 16 im Wohnzimmer — bei COP 3 immer
+#   noch guenstiger als 12 C ueber Kessel+Staebe) UND eine erlaubte Quelle da ist:
+#   - PV-Ueberschuss (nur im Akkubetrieb): MPPT > 200 V und Akku entlaedt nicht anhaltend (gleiches Gate
+#     wie die Staebe; die Klima laeuft sofort, die Staebe rampen erst 2 min spaeter -> sie bekommt den
+#     Ueberschuss zuerst)
+#   - Akku gesund, NUR BEI BESUCH (Audit 28.09. abends): niedrigste WR-Akkuspannung >= 52,5 V zum Start,
+#     laufen bis 51,2 V (dieselbe Hysterese wie das Akku-Heizen der Staebe in 03)
+#   - Netz: NUR im Notlauf UND bei Besuch (ausserhalb des Notlaufs wuerde die Klima am Netz grid_high in
+#     02 ausloesen -> Sperre; im Leerstand soll kein Netzstrom fuer 16 C im Wohnzimmer fliessen)
+# KUEHLEN nur bei Besuch 2S, nur aus PV-Ueberschuss, Raum > 26 C (Hysterese bis 24,5 C), Ziel 24 C.
+# AUS, wenn keine Regel mehr zutrifft.
+# KOMPRESSOR-SCHUTZ: zwischen zwei Modus-Wechseln mindestens 15 min (last_changed des climate-States).
+# SICHERHEIT: SA nicht erreichbar / Watchdog -> aus. Klima nicht erreichbar -> nichts tun.
+# continue_on_error, weil die Klima (Tuya) zeitweise offline ist.
+
+alias: "Klima Wohnzimmer Assist"
+description: "Klima 2S als Waermepumpe: PV-Ueberschuss / gesunder Akku / Netz nur im Notlauf. Kuehlen nur bei Besuch aus PV."
+triggers:
+  - trigger: time_pattern
+    minutes: /2
+  - trigger: state
+    entity_id:
+      - binary_sensor.netzbetrieb_aktiv
+      - binary_sensor.heizstab_notlauf_aktiv
+      - input_boolean.besuch_2s
+      - input_boolean.heizstab_watchdog_sperre
+variables:
+  ac: climate.klima_wohnzimmer
+  verfuegbar: "{{ states('climate.klima_wohnzimmer') not in ['unknown', 'unavailable', 'none'] }}"
+  modus: "{{ states('climate.klima_wohnzimmer') }}"
+  t_raum: "{{ state_attr('climate.klima_wohnzimmer', 'current_temperature') | float(99) }}"
+  besuch: >-
+    {{ is_state('input_boolean.besuch_2s', 'on')
+       or is_state('input_boolean.kessel_abfuhr_komfort', 'on') }}
+  soll_heiz: "{{ 21 if besuch else 16 }}"
+  bat_v: >-
+    {% set ns = namespace(v=[]) %}
+    {% for e in ['sensor.solarassistant_inverter_1_battery_voltage',
+                 'sensor.solarassistant_inverter_2_battery_voltage',
+                 'sensor.solarassistant_inverter_3_battery_voltage'] %}
+      {% set x = states(e) | float(-1) %}
+      {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+    {% endfor %}
+    {{ (ns.v | min) if (ns.v | count) > 0 else -1 }}
+  on_grid: >-
+    {% set g = states('sensor.sichere_netz_leistung') | float(99999) %}
+    {{ is_state('binary_sensor.netzbetrieb_aktiv', 'on') or (g > 500 and g != 99999) }}
+  notlauf: "{{ is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') }}"
+  pv_ok: >-
+    {{ states('sensor.sichere_mppt_spannung') | float(0) > 200
+       and states('sensor.sichere_batterie_leistung') | float(-99999) != -99999
+       and not is_state('binary_sensor.akku_entladung_anhaltend', 'on') }}
+  bat_ok: "{{ bat_v >= (51.2 if modus == 'heat' else 52.5) }}"
+  gesperrt: >-
+    {{ is_state('input_boolean.heizstab_watchdog_sperre', 'on')
+       or not is_state('binary_sensor.solar_assistant_erreichbar', 'on') }}
+  # QUELLEN (Audit 28.09.2026 abends, ersetzt "pv_ok or bat_ok or (on_grid and notlauf)"):
+  # 1) NIE am Netz ausserhalb des Notlaufs: im Netzbetrieb (SBU, 49 bis 53 V) haengen die Lasten am Netz;
+  #    pv_ok/bat_ok waren dort trotzdem wahr (MPPT > 200 V, Akku unter Ladung ueber 52,5 V) -> die Klima
+  #    haette aus dem Netz geheizt und grid_high (02) ausgeloest. PV/Akku zaehlen jetzt nur im Akkubetrieb.
+  # 2) Akku nur bei Besuch: im Leerstand (Soll 12 C ueber die FBH) braucht niemand 16 C im Wohnzimmer aus
+  #    dem Akku. PV-Ueberschuss bleibt immer erlaubt (kostet nichts). Netz im Notlauf ebenfalls nur bei
+  #    Besuch, sonst heizt die Klima 4 K ueber das Leerstand-Soll aus dem Netz.
+  quelle_ok: >-
+    {{ not gesperrt and (
+         (not on_grid and pv_ok)
+         or (not on_grid and bat_ok and besuch)
+         or (on_grid and notlauf and besuch) ) }}
+  heizen_ok: >-
+    {{ verfuegbar and quelle_ok and t_raum < 90
+       and (t_raum < soll_heiz - 0.5 or (modus == 'heat' and t_raum < soll_heiz + 1)) }}
+  kuehlen_ok: >-
+    {{ verfuegbar and not gesperrt and besuch and pv_ok and t_raum < 90
+       and (t_raum > 26 or (modus == 'cool' and t_raum > 24.5)) }}
+  anti_takt: >-
+    {{ states.climate.klima_wohnzimmer is none
+       or (now() - states.climate.klima_wohnzimmer.last_changed).total_seconds() > 900 }}
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ heizen_ok and modus != 'heat' and anti_takt }}"
+        sequence:
+          - action: climate.set_temperature
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              temperature: "{{ soll_heiz }}"
+          - action: climate.set_hvac_mode
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              hvac_mode: heat
+      - conditions:
+          - condition: template
+            value_template: "{{ heizen_ok and modus == 'heat' and (state_attr('climate.klima_wohnzimmer', 'temperature') | float(0)) != soll_heiz | float }}"
+        sequence:
+          - action: climate.set_temperature
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              temperature: "{{ soll_heiz }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ not heizen_ok and kuehlen_ok and modus != 'cool' and anti_takt }}"
+        sequence:
+          - action: climate.set_temperature
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              temperature: 24
+          - action: climate.set_hvac_mode
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              hvac_mode: cool
+      - conditions:
+          - condition: template
+            value_template: "{{ verfuegbar and not heizen_ok and not kuehlen_ok and modus != 'off' and anti_takt }}"
+        sequence:
+          - action: climate.set_hvac_mode
+            continue_on_error: true
+            target:
+              entity_id: climate.klima_wohnzimmer
+            data:
+              hvac_mode: "off"
+mode: single

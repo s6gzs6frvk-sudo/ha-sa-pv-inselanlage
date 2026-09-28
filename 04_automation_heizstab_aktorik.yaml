@@ -1,0 +1,283 @@
+# =============================================================================
+# Ebene C — Heizstab AKTORIK (nur Hardware)
+# =============================================================================
+# Schaltet nur bei Soll-Aenderung oder Sperre — Heartbeat nur Betriebsstunden.
+# PV-Modus: Soll > max_stufe_pv wird gekappt (Notlauf darf 3).
+#
+# FIX (Juni 2026): rod_order-Liste entfernt. rod_a/rod_b/rod_c werden jetzt
+# jeweils EINZELN als String berechnet (sortiert nach Betriebsstunden).
+# Grund: eine Template-Liste in einer Automations-Variable kann je nach
+# HA-Version als String behandelt werden -> rod_order[0] = erstes Zeichen
+# statt erste Entity -> ungueltige entity_id -> Relais bleiben aus.
+# Zusaetzlich: turn_off-Ziele als saubere YAML-Liste aus Einzel-Strings
+# (kein Template, das erst eine Liste erzeugen muss).
+
+alias: "Heizstab Aktorik"
+description: "Relais + Rotation + Betriebsstunden — keine Entscheidungslogik."
+triggers:
+  - trigger: state
+    entity_id: input_number.heizstab_soll_stufe
+  - trigger: state
+    entity_id:
+      - input_boolean.heizstab_sicherheits_sperre
+      - input_boolean.heizstab_watchdog_sperre
+  - trigger: time_pattern
+    minutes: /2
+    id: heartbeat
+  - trigger: homeassistant
+    id: ha_start
+    event: start
+variables:
+  # Notlauf: Akku darf bis ~9 kW liefern, daher Rampen-Gate locker (-6000 =
+  # Platz fuer einen weiteren ~2,87-kW-Stab). PV-Betrieb: nur Ueberschuss (-600).
+  bat_step: >-
+    {{ -6000 if is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') else -600 }}
+  t_oben: "{{ states('sensor.sicherer_kessel_oben') | float(50) }}"
+  t_mitte: "{{ states('sensor.sicherer_kessel_mitte') | float(50) }}"
+  blockiert: >-
+    {{ is_state('input_boolean.heizstab_sicherheits_sperre', 'on')
+       or is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+  soll_raw: "{{ states('input_number.heizstab_soll_stufe') | int(0) }}"
+  max_pv: "{{ states('sensor.heizstab_max_stufe_pv') | int(2) }}"
+  notlauf: "{{ is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') }}"
+  # Im NETZ-Notlauf (Notlauf + am Netz) uebernimmt 08 die Relais PER PHASE.
+  # Diese Aktorik (Rotation/Stufe) haelt sich dann raus, sonst Konflikt um dieselben Switches.
+  # WINTERPAKET (28.09.2026): "am Netz" = binary_sensor.netzbetrieb_aktiv (WR-Modus "Grid" ODER
+  # Netzbezug > 500 W, in 00) — plus der alte 500-W-Weg als Fallback, falls 00 noch nicht neu
+  # geladen ist. Gleiches Kriterium in 08 und im zwang_aus (00); 03 rechnet es inline (on_grid).
+  netz_notlauf: >-
+    {{ notlauf and (is_state('binary_sensor.netzbetrieb_aktiv', 'on')
+       or (states('sensor.sichere_netz_leistung') | float(99999) > 500
+           and states('sensor.sichere_netz_leistung') | float(99999) != 99999)) }}
+  target_level: >-
+    {% if blockiert %}0
+    {% elif notlauf %}{{ soll_raw }}
+    {% else %}{{ [soll_raw, max_pv] | min }}
+    {% endif %}
+  switch_level: |
+    {{ (0 if is_state('switch.boiler_1', 'off') else 1) +
+       (0 if is_state('switch.boiler_2', 'off') else 1) +
+       (0 if is_state('switch.bolier_3', 'off') else 1) }}
+  level3_maintain: >
+    {{ target_level | int == 3 and switch_level | int == 3 }}
+  # --- Rotation: jeder Stab nach geringsten Betriebsstunden, EINZELN als String ---
+  rod_a: >-
+    {% set rods = [
+      {'e': 'switch.boiler_1', 'h': states('input_number.boiler_1_betriebsstunden') | float(0)},
+      {'e': 'switch.boiler_2', 'h': states('input_number.boiler_2_betriebsstunden') | float(0)},
+      {'e': 'switch.bolier_3', 'h': states('input_number.bolier_3_betriebsstunden') | float(0)}
+    ] %}
+    {{ (rods | sort(attribute='h'))[0]['e'] }}
+  rod_b: >-
+    {% set rods = [
+      {'e': 'switch.boiler_1', 'h': states('input_number.boiler_1_betriebsstunden') | float(0)},
+      {'e': 'switch.boiler_2', 'h': states('input_number.boiler_2_betriebsstunden') | float(0)},
+      {'e': 'switch.bolier_3', 'h': states('input_number.bolier_3_betriebsstunden') | float(0)}
+    ] %}
+    {{ (rods | sort(attribute='h'))[1]['e'] }}
+  rod_c: >-
+    {% set rods = [
+      {'e': 'switch.boiler_1', 'h': states('input_number.boiler_1_betriebsstunden') | float(0)},
+      {'e': 'switch.boiler_2', 'h': states('input_number.boiler_2_betriebsstunden') | float(0)},
+      {'e': 'switch.bolier_3', 'h': states('input_number.bolier_3_betriebsstunden') | float(0)}
+    ] %}
+    {{ (rods | sort(attribute='h'))[2]['e'] }}
+actions:
+  - if:
+      - condition: trigger
+        id: ha_start
+    then:
+      - delay: "00:00:50"
+  - choose:
+      # Relais steuern bei jedem Nicht-Heartbeat-Trigger; beim Heartbeat NUR, wenn die Ist-Relais
+      # nicht zum Ziel passen (Mismatch = haengt unter/ueber Ziel, z.B. 3. Stab am Gate gescheitert).
+      # So wird ein Steckenbleiben nachgesteuert, OHNE im Normalfall die Rotation alle 2 min
+      # umzuschalten (passt = Heartbeat tut nichts). Im Netz-Notlauf haelt sich 04 ganz raus (08).
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ not netz_notlauf
+                 and (trigger.id | default('', true) != 'heartbeat'
+                      or switch_level | int != target_level | int) }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ target_level | int == 0 }}"
+                sequence:
+                  - action: switch.turn_off
+                    target:
+                      entity_id:
+                        - switch.boiler_1
+                        - switch.boiler_2
+                        - switch.bolier_3
+              - conditions:
+                  - condition: template
+                    value_template: "{{ target_level | int == 1 }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ rod_a }}"
+                  - action: switch.turn_off
+                    target:
+                      entity_id:
+                        - "{{ rod_b }}"
+                        - "{{ rod_c }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ target_level | int == 2 }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id:
+                        - "{{ rod_a }}"
+                        - "{{ rod_b }}"
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ rod_c }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ target_level | int == 3 and level3_maintain }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id:
+                        - switch.boiler_1
+                        - switch.boiler_2
+                        - switch.bolier_3
+              - conditions:
+                  - condition: template
+                    value_template: "{{ target_level | int == 3 }}"
+                sequence:
+                  # REFRESH VOR DEM GATE (28.09.2026, CSV 27.09. belegt): Blockiert das Akku-Gate
+                  # unten den 3. Stab dauerhaft (Ist 2 != Soll 3), lief der Auto-Off-Refresh am Ende
+                  # der Datei nie (der verlangt Ist == Soll) und diese Sequenz erreichte rod_b nicht
+                  # mehr -> rod_b fiel alle 5 min fuer ~1 min dem Shelly-Auto-Off zum Opfer
+                  # (Last 5.7 -> 2.9 kW um :29/:35/:41). Daher: die bereits LAUFENDEN Staebe zuerst
+                  # bestaetigen (turn_on = Timer-Reset, idempotent), dann die gestaffelte Rampe.
+                  - if:
+                      - condition: state
+                        entity_id: switch.boiler_1
+                        state: "on"
+                    then:
+                      - action: switch.turn_on
+                        target:
+                          entity_id: switch.boiler_1
+                  - if:
+                      - condition: state
+                        entity_id: switch.boiler_2
+                        state: "on"
+                    then:
+                      - action: switch.turn_on
+                        target:
+                          entity_id: switch.boiler_2
+                  - if:
+                      - condition: state
+                        entity_id: switch.bolier_3
+                        state: "on"
+                    then:
+                      - action: switch.turn_on
+                        target:
+                          entity_id: switch.bolier_3
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ rod_a }}"
+                  - delay: "00:00:10"
+                  - condition: template
+                    value_template: >
+                      {{ states('sensor.sichere_batterie_leistung') | float(0) > bat_step | int
+                      and states('sensor.sichere_netz_leistung') | float(0) < 1000
+                      and is_state('binary_sensor.netzspannung_stabil', 'on')
+                      and t_oben < 79 and t_mitte < 83 }}
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ rod_b }}"
+                  - delay: "00:00:10"
+                  - condition: template
+                    value_template: >
+                      {{ states('sensor.sichere_batterie_leistung') | float(0) > bat_step | int
+                      and states('sensor.sichere_netz_leistung') | float(0) < 1000
+                      and is_state('binary_sensor.netzspannung_stabil', 'on')
+                      and t_oben < 79 and t_mitte < 83 }}
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ rod_c }}"
+  # AUTO-OFF-REFRESH (Fix 26.06.2026): Die drei Shelly-Relais haben auf dem Shelly einen
+  # 5-min Auto-Off als "Handbremse" (geht HA verloren, schalten die Staebe nach 5 min selbst
+  # ab). Im Normalbetrieb tut ein "passender" Heartbeat sonst NICHTS -> der Auto-Off-Timer
+  # laeuft ab und der laufende Stab faellt grundlos raus, bis der naechste Heartbeat den
+  # Mismatch nachzieht (~bis zu 2 min Loch alle ~5 min). Daher: bei jedem PASSENDEN Heartbeat
+  # (Soll == Ist, Soll > 0, kein Netz-Notlauf) die AKTUELL an-Staebe erneut bestaetigen
+  # (turn_on = Timer-Reset). KEINE neue Rotation (genau die laufenden Relais), kein turn_off.
+  # Bei Mismatch hat der choose-Block oben schon geschaltet (= ebenfalls Timer-Reset).
+  - if:
+      - condition: trigger
+        id: heartbeat
+      - condition: template
+        value_template: >-
+          {{ not netz_notlauf and target_level | int > 0
+             and switch_level | int == target_level | int }}
+    then:
+      - if:
+          - condition: state
+            entity_id: switch.boiler_1
+            state: "on"
+        then:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.boiler_1
+      - if:
+          - condition: state
+            entity_id: switch.boiler_2
+            state: "on"
+        then:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.boiler_2
+      - if:
+          - condition: state
+            entity_id: switch.bolier_3
+            state: "on"
+        then:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.bolier_3
+  - if:
+      - condition: trigger
+        id: heartbeat
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ is_state('switch.boiler_1', 'on') }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.boiler_1_betriebsstunden
+            data:
+              value: >-
+                {{ (states('input_number.boiler_1_betriebsstunden') | float(0) + 0.0333)
+                   | round(2) }}
+      - if:
+          - condition: template
+            value_template: "{{ is_state('switch.boiler_2', 'on') }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.boiler_2_betriebsstunden
+            data:
+              value: >-
+                {{ (states('input_number.boiler_2_betriebsstunden') | float(0) + 0.0333)
+                   | round(2) }}
+      - if:
+          - condition: template
+            value_template: "{{ is_state('switch.bolier_3', 'on') }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.bolier_3_betriebsstunden
+            data:
+              value: >-
+                {{ (states('input_number.bolier_3_betriebsstunden') | float(0) + 0.0333)
+                   | round(2) }}
+mode: queued
+max: 3

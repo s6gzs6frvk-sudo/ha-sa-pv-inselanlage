@@ -1,0 +1,52 @@
+{# Einfuegen in HA: Entwicklerwerkzeuge -> Template. Listet alle Entitaeten, die die Dateien 00-09
+   brauchen und die in HA FEHLEN oder gerade keinen Wert haben. Stand 28.09.2026 abends (7 Automationen 02/03/04/05/08/09/10 plus optional 11, 32 Template-Sensoren). #}
+{% set ids = [
+  'sensor.sicherer_batterie_soc','sensor.sichere_pv_leistung','sensor.sichere_batterie_leistung',
+  'sensor.sichere_netz_leistung','sensor.sichere_mppt_spannung',
+  'sensor.sicherer_kessel_oben','sensor.sicherer_kessel_mitte',
+  'sensor.sichere_boiler_1_leistung','sensor.sichere_boiler_2_leistung','sensor.sichere_bolier_3_leistung',
+  'sensor.kessel_heizleistung_gesamt','sensor.heizstab_effektive_stufe','sensor.pv_potenzial',
+  'sensor.heizstab_max_stufe_pv','sensor.durchschnittstemperatur_og2','sensor.durchschnittstemperatur_og3',
+  'sensor.durchschnitts_sollwert_og2','sensor.durchschnitts_sollwert_og3',
+  'sensor.heizstab_status_grund','sensor.pumpen_status_grund',
+  'binary_sensor.netzspannung_stabil','binary_sensor.heizstab_notlauf_aktiv','binary_sensor.netzbetrieb_aktiv',
+  'binary_sensor.raeume_brauchen_waerme',
+  'binary_sensor.phase_1_stabil','binary_sensor.phase_2_stabil','binary_sensor.phase_3_stabil',
+  'binary_sensor.akku_entladung_anhaltend','binary_sensor.heizstab_hochschalten_erlaubt',
+  'binary_sensor.heizstab_sicherheit_zwang_aus','binary_sensor.solar_assistant_erreichbar',
+  'binary_sensor.solar_estrich_moeglich',
+  'input_boolean.heizstab_nachtsperre','input_boolean.heizstab_sicherheits_sperre','input_boolean.heizstab_watchdog_sperre',
+  'input_boolean.heizsaison','input_boolean.besuch_eg','input_boolean.besuch_2s','input_boolean.besuch_3s',
+  'input_boolean.kessel_abfuhr_komfort',
+  'input_number.leerstand_soll','input_number.heizstab_soll_stufe','input_number.boiler_1_betriebsstunden',
+  'input_number.boiler_2_betriebsstunden','input_number.bolier_3_betriebsstunden',
+  'input_datetime.letzter_heizstab_abwurf','input_datetime.letzter_pv_step_down','input_datetime.letzter_pumpen_schaltvorgang',
+  'switch.boiler_1','switch.boiler_2','switch.bolier_3','switch.pumpen','switch.shelly1minig4_ccba97c02fc8',
+  'sensor.boiler_1_leistung','sensor.boiler_2_leistung','sensor.bolier_3_leistung',
+  'sensor.shelly1pmg4_e4b0637a7e74_temperatur_2','sensor.shelly1pmg4_e4b0637a7e74_temperatur_3',
+  'sensor.shelly_blu_h_t_b414_temperatur',
+  'climate.wohnzimmer','climate.kinderzimmer','climate.bad_flur',
+  'climate.shellywalldisplay_00a90b53f2d5','climate.shellywalldisplay_00082256e8b8',
+  'climate.shellywalldisplay_0008221c2dcc','climate.shellywalldisplay_00082273ad2f',
+  'climate.klima_wohnzimmer',
+  'sensor.solarassistant_battery_power','sensor.solarassistant_battery_state_of_charge','sensor.solarassistant_pv_power',
+  'sensor.solarassistant_grid_power',
+  'sensor.solarassistant_inverter_1_battery_voltage','sensor.solarassistant_inverter_2_battery_voltage','sensor.solarassistant_inverter_3_battery_voltage',
+  'sensor.solarassistant_inverter_1_device_mode','sensor.solarassistant_inverter_2_device_mode','sensor.solarassistant_inverter_3_device_mode',
+  'sensor.solarassistant_inverter_1_grid_power','sensor.solarassistant_inverter_2_grid_power','sensor.solarassistant_inverter_3_grid_power',
+  'sensor.solarassistant_inverter_1_grid_voltage','sensor.solarassistant_inverter_2_grid_voltage','sensor.solarassistant_inverter_3_grid_voltage',
+  'sensor.solarassistant_inverter_1_pv_voltage_1','sensor.solarassistant_inverter_2_pv_voltage_1','sensor.solarassistant_inverter_3_pv_voltage_1',
+  'select.solarassistant_inverter_1_charger_source_priority','select.solarassistant_inverter_2_charger_source_priority','select.solarassistant_inverter_3_charger_source_priority'
+] %}
+{% set ns = namespace(f=[]) %}
+{% for e in ids %}{% if states(e) in ['unknown', 'unavailable'] %}{% set ns.f = ns.f + [e ~ ' = ' ~ states(e)] %}{% endif %}{% endfor %}
+Geprueft: {{ ids | count }} Entitaeten.
+{% if ns.f %}FEHLT oder ohne Wert ({{ ns.f | count }}):
+{{ ns.f | join('
+') }}{% else %}ALLE VORHANDEN.{% endif %}
+
+Zur Kontrolle der Logik:
+Netzbetrieb aktiv = {{ states('binary_sensor.netzbetrieb_aktiv') }} | WR-Modus = {{ states('sensor.solarassistant_inverter_1_device_mode') }}
+Notlauf aktiv = {{ states('binary_sensor.heizstab_notlauf_aktiv') }} | Raeume brauchen Waerme = {{ states('binary_sensor.raeume_brauchen_waerme') }} | Leerstand-Soll = {{ states('input_number.leerstand_soll') }}
+Status = {{ states('sensor.heizstab_status_grund') }}
+Akku min = {{ [states('sensor.solarassistant_inverter_1_battery_voltage')|float(0), states('sensor.solarassistant_inverter_2_battery_voltage')|float(0), states('sensor.solarassistant_inverter_3_battery_voltage')|float(0)] | min }} V | Ladequelle WR1 = {{ states('select.solarassistant_inverter_1_charger_source_priority') }}

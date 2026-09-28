@@ -1,0 +1,621 @@
+# =============================================================================
+# KOMPLETTE configuration.yaml fuer Home Assistant (Stand 28.09.2026 spaet)
+# =============================================================================
+# Diese Datei ist die GANZE configuration.yaml: Inhalt komplett markieren, kopieren, in HA
+# (File Editor / Studio Code Server) die bestehende configuration.yaml komplett damit
+# ersetzen, speichern. Danach: Entwicklerwerkzeuge -> YAML -> "Konfiguration pruefen" muss
+# gruen sein -> dann "Template-Entitaeten" neu laden (reicht fuer Aenderungen an den Sensoren;
+# ein Neustart ist nur noetig, wenn sich etwas AUSSERHALB von template: geaendert hat).
+#
+# VORAUSSETZUNG: Deine configuration.yaml enthaelt sonst nichts Eigenes. Stand 28.09.2026
+# bestand sie nur aus den vier Standardzeilen unten plus dem template:-Block. Sollte spaeter
+# etwas dazukommen (z. B. recorder:, http:, logger:), gehoert es ZUSAETZLICH hier hinein,
+# jeder Schluessel nur EINMAL.
+#
+# Die vier Standardzeilen sind Pflicht (Vorfall 28.09.2026: ohne sie laedt HA keine
+# Automationen; automations.yaml bleibt dabei unversehrt, wird nur nicht geladen).
+# Helfer (Datei 01) werden NICHT hier, sondern in der Oberflaeche angelegt (Einstellungen ->
+# Geraete & Dienste -> Helfer). Datei 01 ist nur die Referenz dafuer.
+
+default_config:
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# =============================================================================
+# TEMPLATE-SENSOREN (32 Stueck): sichere Sensoren, Freigaben, MPPT-Signal, Phasenschutz,
+# Status-Texte. Referenz und Erklaerungen: AGENT_KONTEXT.md Abschnitt 4 und 17.
+# =============================================================================
+# - "template:" darf nur EINMAL vorkommen.
+# - Alles darunter ist eine Liste: erst "- sensor:", dann "- trigger:" mit "sensor:",
+#   dann "- binary_sensor:", alle mit GLEICHER Einrueckung (2 Leerzeichen).
+# - Kommentare NIE innerhalb eines Jinja-Blocks mit '#', nur {# ... #}.
+template:
+  - sensor:
+      - name: "Sicherer Batterie SOC"
+        unique_id: safe_battery_soc
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >
+          {% if states('sensor.solarassistant_battery_state_of_charge') in ['unknown', 'unavailable', 'none'] %}
+            0
+          {% else %}
+            {{ states('sensor.solarassistant_battery_state_of_charge') | float(0) }}
+          {% endif %}
+
+      - name: "Sichere PV Leistung"
+        unique_id: safe_pv_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% if states('sensor.solarassistant_pv_power') in ['unknown', 'unavailable', 'none'] %}
+            -99999
+          {% else %}
+            {{ states('sensor.solarassistant_pv_power') | float(-99999) }}
+          {% endif %}
+
+      - name: "Sichere Batterie Leistung"
+        unique_id: safe_battery_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% if states('sensor.solarassistant_battery_power') in ['unknown', 'unavailable', 'none'] %}
+            -99999
+          {% else %}
+            {{ states('sensor.solarassistant_battery_power') | float(-99999) }}
+          {% endif %}
+
+      - name: "Sichere Netz Leistung"
+        unique_id: safe_grid_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% if states('sensor.solarassistant_grid_power') in ['unknown', 'unavailable', 'none'] %}
+            99999
+          {% else %}
+            {{ states('sensor.solarassistant_grid_power') | float(99999) }}
+          {% endif %}
+
+      - name: "Sichere MPPT Spannung"
+        unique_id: safe_mppt_voltage
+        unit_of_measurement: "V"
+        device_class: voltage
+        # "Sonne-da"-Signal (4. Runde, 26.06.2026): MPPT-1-Spannung steigt bei Abregelung
+        # Richtung Voc (Leerlauf), waehrend die Leistung ~0 ist. Tag ~400 V, Nacht ~25 V
+        # (per Chart belegt) -> klares Signal, UNABHAENGIG von der abgeregelten PV-Leistung
+        # und vom wandernden SOC-Deckel. MAX ueber die 3 parallelen WR (ein ausgefallener
+        # WR poisont das Signal nicht). NUR MPPT 1 (dort haengen die Module); MPPT 2 fuehrt
+        # keinen Strom = keine Module.
+        # entity_ids vom Nutzer am 26.06.2026 bestaetigt (inverter_1/2/3_pv_voltage_1).
+        # Sanity-Check nach jedem groesseren HA-/SA-Update: liest dieser Sensor TAGSUEBER 0
+        # statt ~400, haben sich die Namen geaendert -> anpassen (sonst feuert der Bootstrap
+        # nie und der Zero-Export-Deadlock kommt zurueck).
+        state: >
+          {% set v1 = states('sensor.solarassistant_inverter_1_pv_voltage_1') %}
+          {% set v2 = states('sensor.solarassistant_inverter_2_pv_voltage_1') %}
+          {% set v3 = states('sensor.solarassistant_inverter_3_pv_voltage_1') %}
+          {{ [v1, v2, v3] | map('float', 0) | list | max }}
+
+      - name: "Sicherer Kessel Oben"
+        unique_id: safe_boiler_temp_top
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >
+          {% set s = states('sensor.shelly1pmg4_e4b0637a7e74_temperatur_2') %}
+          {{ 50 if s in ['unavailable', 'unknown', 'none'] else s | float(50) }}
+
+      - name: "Sicherer Kessel Mitte"
+        unique_id: safe_boiler_temp_mid
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >
+          {% set s = states('sensor.shelly1pmg4_e4b0637a7e74_temperatur_3') %}
+          {{ 50 if s in ['unavailable', 'unknown', 'none'] else s | float(50) }}
+
+      - name: "Sichere Boiler 1 Leistung"
+        unique_id: safe_boiler_1_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set s = states('sensor.boiler_1_leistung') %}
+          {{ 0 if s in ['unknown', 'unavailable', 'none'] else s | float(0) }}
+
+      - name: "Sichere Boiler 2 Leistung"
+        unique_id: safe_boiler_2_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set s = states('sensor.boiler_2_leistung') %}
+          {{ 0 if s in ['unknown', 'unavailable', 'none'] else s | float(0) }}
+
+      - name: "Sichere Bolier 3 Leistung"
+        unique_id: safe_bolier_3_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set s = states('sensor.bolier_3_leistung') %}
+          {{ 0 if s in ['unknown', 'unavailable', 'none'] else s | float(0) }}
+
+      - name: "Kessel Heizleistung Gesamt"
+        unique_id: safe_boiler_heater_power_total
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {{ states('sensor.sichere_boiler_1_leistung') | float(0)
+             + states('sensor.sichere_boiler_2_leistung') | float(0)
+             + states('sensor.sichere_bolier_3_leistung') | float(0) }}
+
+      - name: "Heizstab Effektive Stufe"
+        unique_id: boiler_effective_heater_level
+        state: >
+          {% set t = 200 %}
+          {% set p1 = states('sensor.sichere_boiler_1_leistung') | float(0) %}
+          {% set p2 = states('sensor.sichere_boiler_2_leistung') | float(0) %}
+          {% set p3 = states('sensor.sichere_bolier_3_leistung') | float(0) %}
+          {{ (1 if p1 > t else 0) + (1 if p2 > t else 0) + (1 if p3 > t else 0) }}
+
+      - name: "PV Potenzial"
+        unique_id: pv_potential_power
+        unit_of_measurement: "W"
+        device_class: power
+        state: >
+          {% set pv = states('sensor.sichere_pv_leistung') | float(-99999) %}
+          {% if pv == -99999 %}-99999{% else %}
+          {{ pv + states('sensor.kessel_heizleistung_gesamt') | float(0) }}
+          {% endif %}
+
+      - name: "Heizstab Max Stufe PV"
+        unique_id: heater_max_level_pv
+        state: >
+          {% set soc = states('sensor.sicherer_batterie_soc') | float(0) %}
+          {% if soc < 45 %}0{% elif soc < 65 %}2{% else %}3{% endif %}
+
+      # OG-DURCHSCHNITTSSENSOREN (26.06.2026 aus 04/REFERENZ_nuggets.md hierher portiert):
+      # Werden von der Pumpenlogik (05) und vom Pumpen-Status-Grund (unten) GENUTZT, waren
+      # aber bisher in diesem Repo NIRGENDS definiert -> ohne sie fiel die OG-Pumpensteuerung
+      # auf die Defaults zurueck (Temp 99 = "immer warm genug" -> kein Heizen).
+      # ACHTUNG beim Einbau in HA: NUR uebernehmen, falls diese vier Sensoren nicht bereits
+      # in deiner configuration.yaml stehen (sonst doppelter unique_id -> Konfig-Fehler).
+      # Defaults bewusst konservativ: Temp 99 = kein Heizbedarf gemeldet (blockiert nicht),
+      # Sollwert 17 = neutrales Leerziel.
+      - name: "Durchschnittstemperatur OG2"
+        unique_id: avg_temp_og2
+        unit_of_measurement: "°C"
+        state: >
+          {% set t = [
+            state_attr('climate.wohnzimmer', 'current_temperature'),
+            state_attr('climate.kinderzimmer', 'current_temperature'),
+            state_attr('climate.bad_flur', 'current_temperature')
+          ] | map('float', default=99) | select('lt', 99) | list %}
+          {{ (t | sum / t | count) | round(1) if t | count > 0 else 99 }}
+
+      - name: "Durchschnittstemperatur OG3"
+        unique_id: avg_temp_og3
+        unit_of_measurement: "°C"
+        state: >
+          {% set t = [
+            state_attr('climate.shellywalldisplay_00a90b53f2d5', 'current_temperature'),
+            state_attr('climate.shellywalldisplay_00082256e8b8', 'current_temperature'),
+            state_attr('climate.shellywalldisplay_0008221c2dcc', 'current_temperature'),
+            state_attr('climate.shellywalldisplay_00082273ad2f', 'current_temperature')
+          ] | map('float', default=99) | select('lt', 99) | list %}
+          {{ (t | sum / t | count) | round(1) if t | count > 0 else 99 }}
+
+      - name: "Durchschnitts_Sollwert OG2"
+        unique_id: avg_target_og2
+        unit_of_measurement: "°C"
+        state: >
+          {% set s = [
+            state_attr('climate.wohnzimmer', 'temperature'),
+            state_attr('climate.kinderzimmer', 'temperature'),
+            state_attr('climate.bad_flur', 'temperature')
+          ] | map('float', default=17) | select('gt', 0) | list %}
+          {{ (s | sum / s | count) | round(1) if s | count > 0 else 17 }}
+
+      - name: "Durchschnitts_Sollwert OG3"
+        unique_id: avg_target_og3
+        unit_of_measurement: "°C"
+        state: >
+          {% set s = [
+            state_attr('climate.shellywalldisplay_00a90b53f2d5', 'temperature'),
+            state_attr('climate.shellywalldisplay_00082256e8b8', 'temperature'),
+            state_attr('climate.shellywalldisplay_0008221c2dcc', 'temperature'),
+            state_attr('climate.shellywalldisplay_00082273ad2f', 'temperature')
+          ] | map('float', default=17) | select('gt', 0) | list %}
+          {{ (s | sum / s | count) | round(1) if s | count > 0 else 17 }}
+
+  # PERF (4. Runde, 26.06.2026): Die zwei status_grund-Sensoren sind reine Anzeigetexte
+  # OHNE Steuerwirkung. Frueher (state-basiert) rendern sie bei JEDEM Leistungs-/Temp-Tick
+  # neu (Solar Assistant pusht alle 1-3 s) -> teuerster Dauer-Posten. Jetzt TRIGGER-basiert:
+  # nur alle 30 s + bei wichtigen State-Wechseln (Soll/Sperren/Freigabe/Pumpen). ~150x
+  # weniger Renders, null Funktionsverlust (30-s-Frische reicht fuer Menschen-lesbaren Text).
+  - trigger:
+      - trigger: time_pattern
+        seconds: "/30"
+      - trigger: state
+        entity_id:
+          - input_number.heizstab_soll_stufe
+          - input_boolean.heizstab_sicherheits_sperre
+          - input_boolean.heizstab_watchdog_sperre
+          - input_boolean.heizstab_nachtsperre
+          - binary_sensor.heizstab_notlauf_aktiv
+          - binary_sensor.heizstab_hochschalten_erlaubt
+          - binary_sensor.heizstab_sicherheit_zwang_aus
+          - switch.pumpen
+          - switch.shelly1minig4_ccba97c02fc8
+          - input_boolean.besuch_eg
+          - input_boolean.besuch_2s
+          - input_boolean.besuch_3s
+          - input_boolean.kessel_abfuhr_komfort
+          - input_boolean.heizsaison
+          - input_number.leerstand_soll
+          - binary_sensor.raeume_brauchen_waerme
+    sensor:
+      - name: "Heizstab Status Grund"
+        unique_id: heater_status_reason
+        icon: mdi:message-text-outline
+        state: >
+          {% set soll = states('input_number.heizstab_soll_stufe') | int(0) %}
+          {% set eff = states('sensor.heizstab_effektive_stufe') | int(0) %}
+          {% set soc = states('sensor.sicherer_batterie_soc') | float(0) %}
+          {% set max_pv = states('sensor.heizstab_max_stufe_pv') | int(0) %}
+          {% set t_oben = states('sensor.sicherer_kessel_oben') | float(0) %}
+          {% set t_mitte = states('sensor.sicherer_kessel_mitte') | float(0) %}
+          {% set bat = states('sensor.sichere_batterie_leistung') | float(-99999) %}
+          {% set pv_pot = states('sensor.pv_potenzial') | float(-99999) %}
+          {% set mppt_v = states('sensor.sichere_mppt_spannung') | float(0) %}
+          {% set cd_rest = 600 - (as_timestamp(now())
+             - as_timestamp(states('input_datetime.letzter_heizstab_abwurf'), 0)) %}
+          {% if is_state('input_boolean.heizstab_sicherheits_sperre', 'on') %}
+            Aus: Sicherheitssperre aktiv
+          {% elif is_state('input_boolean.heizstab_watchdog_sperre', 'on') %}
+            Aus: Watchdog — Solar Assistant/Daten fehlen
+          {% elif is_state('binary_sensor.heizstab_sicherheit_zwang_aus', 'on') %}
+            {% if t_oben >= 79 %}Aus: Kessel oben >= 79 °C
+            {% elif t_mitte >= 83 %}Aus: Kessel mitte >= 83 °C
+            {% elif pv_pot == -99999 %}Aus: PV-Daten ungültig
+            {% elif bat == -99999 %}Aus: Batteriedaten ungültig
+            {% elif is_state('binary_sensor.netzspannung_stabil', 'off') %}
+              Aus: Netzspannung instabil
+            {% else %}Aus: Sicherheits-Zwang aus
+            {% endif %}
+          {% elif is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') %}
+            Notlauf: Soll {{ soll }}, effektiv {{ eff }} (Mitte {{ t_mitte | round(1) }} °C)
+          {% elif is_state('input_boolean.heizstab_nachtsperre', 'on') and soll == 0 %}
+            Aus: Nachtsperre (PV lange sehr niedrig)
+          {% elif max_pv == 0 %}
+            Aus: SOC {{ soc | round(0) }} % — unter 45 % keine Stäbe
+          {% elif soll == 0 and not is_state('binary_sensor.heizstab_hochschalten_erlaubt', 'on') %}
+            {% if is_state('input_boolean.heizstab_nachtsperre', 'on') %}
+              Aus: Nachtsperre
+            {% elif soc < 45 %}Aus: SOC unter 45 %
+            {% elif t_oben >= 76 %}Aus: oben >= 76 °C, kein Hochschalten
+            {% elif pv_pot == -99999 %}Aus: PV-Sensor fehlt
+            {% elif bat == -99999 %}Aus: Batterie-Sensor fehlt
+            {% elif bat <= -100 %}Aus: Batterie entlädt
+            {% elif mppt_v <= 200 %}Aus: keine Sonne (MPPT {{ mppt_v | round(0) }} V)
+            {% else %}Aus: Hochschalten nicht erlaubt
+            {% endif %}
+          {% elif soll == 0 and cd_rest > 0 %}
+            Aus: Cooldown nach hartem Abwurf (noch ~{{ (cd_rest / 60) | round(0) }} min)
+          {% elif soll > 0 and eff == 0 %}
+            Soll {{ soll }}, Relais an — keine Leistung (Thermostat?)
+          {% elif soll != eff %}
+            Soll {{ soll }}, effektiv {{ eff }} — Anpassung läuft
+          {% else %}
+            Läuft: Soll {{ soll }}, effektiv {{ eff }} (max {{ max_pv }}, SOC {{ soc | round(0) }} %)
+          {% endif %}
+
+      - name: "Pumpen Status Grund"
+        unique_id: pumps_status_reason
+        icon: mdi:message-text-outline
+        state: >
+          {% set temp_og2 = states('sensor.durchschnittstemperatur_og2') | float(99) %}
+          {% set temp_og3 = states('sensor.durchschnittstemperatur_og3') | float(99) %}
+          {% set soll_og2 = states('sensor.durchschnitts_sollwert_og2') | float(17) %}
+          {% set soll_og3 = states('sensor.durchschnitts_sollwert_og3') | float(17) %}
+          {% set t_eg = states('sensor.shelly_blu_h_t_b414_temperatur') | float(99) %}
+          {% set abfuhr = is_state('input_boolean.kessel_abfuhr_komfort', 'on') %}
+          {% set s_eg = 21 if (is_state('input_boolean.besuch_eg', 'on') or abfuhr) else states('input_number.leerstand_soll') | float(17) %}
+          {% set bedarf_eg = t_eg <= s_eg + 0.5 if is_state('switch.shelly1minig4_ccba97c02fc8', 'on') else t_eg < s_eg - 0.5 %}
+          {% set b2 = temp_og2 <= soll_og2 + 0.5 if is_state('switch.pumpen', 'on') else temp_og2 < soll_og2 - 0.5 %}
+          {% set b3 = temp_og3 <= soll_og3 + 0.5 if is_state('switch.pumpen', 'on') else temp_og3 < soll_og3 - 0.5 %}
+          {% set bedarf_oben = b2 or b3 %}
+          {% set t_mitte = states('sensor.sicherer_kessel_mitte') | float(50) %}
+          {% set t_oben = states('sensor.sicherer_kessel_oben') | float(50) %}
+          {% set nur_eg = bedarf_eg and not bedarf_oben %}
+          {% set boiler_hot = (t_mitte > 28 and t_oben > 32) if nur_eg else (t_mitte > 32 and t_oben > 38 if is_state('switch.pumpen', 'on') else t_mitte > 35 and t_oben > 42) %}
+          {% set kessel_voll = t_oben > 70 and t_mitte > 70 %}
+          {% set last_sw = as_timestamp(states('input_datetime.letzter_pumpen_schaltvorgang'), 0) %}
+          {% set cooldown_ok = (as_timestamp(now()) - last_sw) > 600 %}
+          {% set ziel_haupt = kessel_voll or ((bedarf_oben or bedarf_eg) and boiler_hot) %}
+          {% set ziel_eg = kessel_voll or (bedarf_eg and boiler_hot) %}
+          {% set pumpen_an = is_state('switch.pumpen', 'on') %}
+          {% set eg_an = is_state('switch.shelly1minig4_ccba97c02fc8', 'on') %}
+          {% if kessel_voll and pumpen_an %}
+            Läuft: Kessel voll >70 °C (Wärmeabgabe)
+          {% elif ziel_haupt and pumpen_an and ziel_eg and eg_an %}
+            Läuft: Bedarf OG/EG, Kessel warm genug
+          {% elif ziel_haupt and pumpen_an %}
+            Läuft: OG-Pumpe (Bedarf oben{% if bedarf_eg %}, auch EG{% endif %})
+          {% elif ziel_haupt and not pumpen_an and not cooldown_ok %}
+            Aus: soll AN, Pumpen-Cooldown (~10 min)
+          {% elif not bedarf_eg and not bedarf_oben %}
+            Aus: kein Heizbedarf (Räume warm genug)
+          {% elif not boiler_hot %}
+            Aus: Kessel zu kalt (oben {{ t_oben | round(0) }} °C, mitte {{ t_mitte | round(0) }} °C)
+          {% elif not cooldown_ok %}
+            Aus: Pumpen-Cooldown aktiv
+          {% elif ziel_eg and not eg_an and bedarf_eg and boiler_hot %}
+            Aus: EG-Pumpe soll AN, Haupt={{ 'an' if pumpen_an else 'aus' }}
+          {% else %}
+            Aus: kein Pumpenbedarf (Ziel Haupt={{ ziel_haupt }}, EG={{ ziel_eg }})
+          {% endif %}
+
+  - binary_sensor:
+      # NETZSPANNUNG STABIL (global, fuers PV-/Akku-Heizen in 03/04 und den zwang_aus): seit 28.09.2026
+      # einfach das UND der drei Per-Phase-Sensoren unten (dort stehen die Bruder-Werte 185/190 V,
+      # 60 s / 3 s und das 100-W-Bezugs-Gate). Vorher stand hier dieselbe Hysterese ein zweites Mal
+      # auf dem Minimum der drei Spannungen — doppelte Logik, jetzt eine Quelle. Keine eigenen
+      # Verzoegerungen mehr (die Phasen-Sensoren bringen sie mit).
+      - name: "Netzspannung Stabil"
+        unique_id: grid_voltage_stable
+        device_class: safety
+        state: >
+          {{ is_state('binary_sensor.phase_1_stabil', 'on')
+             and is_state('binary_sensor.phase_2_stabil', 'on')
+             and is_state('binary_sensor.phase_3_stabil', 'on') }}
+
+      # RAEUME BRAUCHEN WAERME (28.09.2026, Nutzer-Wunsch "nur der Besuchsschalter, Rest automatisch"):
+      # ON, sobald EIN Raum unter seinem Soll liegt (EG-Fuehler gegen Leerstand-Soll bzw. 21 bei
+      # Besuch/Abfuhr; OG2/OG3-Mittel gegen die Thermostat-Sollwerte, die 05 setzt). Hysterese wie in
+      # 05: an unter Soll - 0,5, aus erst ab Soll + 0,5 (this.state). Sensorausfall (Default 99) =
+      # kein Bedarf. Steuert das Notlauf-Ziel unten: kein Saison-Schalter mehr noetig.
+      - name: "Raeume Brauchen Waerme"
+        unique_id: rooms_need_heat
+        device_class: heat
+        state: >
+          {% set on = this.state == 'on' %}
+          {% set abfuhr = is_state('input_boolean.kessel_abfuhr_komfort', 'on') %}
+          {% set s_eg = 21 if (is_state('input_boolean.besuch_eg', 'on') or abfuhr)
+                        else states('input_number.leerstand_soll') | float(17) %}
+          {% set t_eg = states('sensor.shelly_blu_h_t_b414_temperatur') | float(99) %}
+          {% set t2 = states('sensor.durchschnittstemperatur_og2') | float(99) %}
+          {% set t3 = states('sensor.durchschnittstemperatur_og3') | float(99) %}
+          {% set s2 = states('sensor.durchschnitts_sollwert_og2') | float(17) %}
+          {% set s3 = states('sensor.durchschnitts_sollwert_og3') | float(17) %}
+          {% set d = -0.5 if not on else 0.5 %}
+          {{ t_eg < s_eg + d or t2 < s2 + d or t3 < s3 + d }}
+
+      # NOTLAUF-ZIEL (28.09.2026): Besuch 50 C (Nutzer 28.09. spaet, vorher 40: Warmwasser-Komfort, Hygiene-
+      # speicher ueblich 50-55 C oben; gemessen wird die KESSELMITTE, oben liegt dann ~55-60 C), RAEUME
+      # BRAUCHEN WAERME 38 C (automatisch, ersetzt den Heizsaison-Schalter), sonst 26 C (Frostschutz
+      # Speicher). Hysterese: heizt bis Ziel + 4 C (Mitte), startet wieder unter Ziel. Grund fuer 38: Die Pumpen (05)
+      # starten erst ab Kessel mitte > 35 / oben > 42 C. Mit 26 C hielt der Notlauf den Speicher im
+      # Winter-Leerstand auf 26-30 C -> Pumpen liefen nie -> Haus kuehlte trotz Netz aus. Ziel 38
+      # heizt bis 42 C (Mitte) -> oben sicher > 42 -> Pumpen springen an. Sommer: Raeume warm ->
+      # kein Bedarf -> 26 C -> kein Netzheizen fuer nichts. input_boolean.heizsaison bleibt nur
+      # noch fuer den Solar-Estrich-Indikator.
+      - name: "Heizstab Notlauf Aktiv"
+        unique_id: heater_emergency_active
+        device_class: heat
+        state: >
+          {% set t_m = states('sensor.sicherer_kessel_mitte') | float(50) %}
+          {% set lvl = states('sensor.heizstab_effektive_stufe') | int(0) %}
+          {% set target = 50 if (
+            is_state('input_boolean.besuch_eg', 'on') or
+            is_state('input_boolean.besuch_2s', 'on') or
+            is_state('input_boolean.besuch_3s', 'on')
+          ) else (38 if is_state('binary_sensor.raeume_brauchen_waerme', 'on') else 26) %}
+          {{ t_m < target or (t_m < (target + 4) and lvl > 0) }}
+
+      # NETZBETRIEB AKTIV (WINTERPAKET 28.09.2026, Roadmap-Punkt aus Abschnitt 10): EIN gemeinsamer
+      # "am Netz"-Sensor fuer 04/08/00 statt drei inline-Pruefungen. ON, wenn ein WR im Netzbetrieb
+      # meldet (Solar-Assistant-String dieser Anlage exakt "Grid"; Varianten fuer Treiber-Updates;
+      # EXAKTER Vergleich, "Off-grid" darf nie matchen) ODER der Netzbezug ueber der Bruder-Schwelle
+      # liegt (500 W rein, 300 W raus = Hysterese). Noetig, weil am Netz bei Grundlast nur ~290 W
+      # fliessen (< 500) und 08 sonst erst nach dem ersten Stab aus 04 uebernahm. delay_off 30 s
+      # gegen kurze Modus-Luecken beim SA-Neustart. 03 rechnet dasselbe inline (on_grid).
+      - name: "Netzbetrieb Aktiv"
+        unique_id: grid_mode_active
+        device_class: power
+        delay_off:
+          seconds: 30
+        state: >
+          {% set grid = states('sensor.sichere_netz_leistung') | float(99999) %}
+          {% set schwelle = 300 if this.state == 'on' else 500 %}
+          {% set ns = namespace(g=false) %}
+          {% for e in ['sensor.solarassistant_inverter_1_device_mode',
+                       'sensor.solarassistant_inverter_2_device_mode',
+                       'sensor.solarassistant_inverter_3_device_mode'] %}
+            {% if (states(e) | lower | trim) in ['grid', 'utility', 'line', 'line mode', 'mains', 'bypass'] %}
+              {% set ns.g = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.g or (grid > schwelle and grid != 99999) }}
+
+      # PER-PHASE-Phasenschutz (5. Runde, Bruder-Entwurf) — fuer das Netz-Notlauf-Heizen (08).
+      # Hysterese TRIP < 185 / RECOVER >= 190, delay_on 60 s (Bruder-Recover), delay_off 3 s
+      # (direkt raus). Bezugs-Gate: Spannung nur werten, wenn dieser WR aus dem Netz zieht
+      # (grid_power > 100 W) — sonst (Akku/Insel) liest der WR die schwache EXTERNE Netzspannung.
+      #
+      # ZUORDNUNG PER SERIENNUMMER (28.09.2026, aus der HA-Aufzeichnung 15:00-16:45 gemessen: beim
+      # Einschalten eines Stabs springt die Last GENAU EINES WR um ~2,7 kW):
+      #   "Phase 1" = der WR, der boiler_1 speist  = Seriennummer SERIAL_WR_BOILER_1 (3P3, Netz-L3)
+      #   "Phase 2" = der WR, der boiler_2 speist  = Seriennummer SERIAL_WR_BOILER_2 (3P2, Netz-L2)
+      #   "Phase 3" = der WR, der bolier_3 speist  = Seriennummer SERIAL_WR_BOLIER_3 (3P1, Netz-L1, Master)
+      # Die frueher angenommene Reihenfolge boiler_1=L1 war FALSCH (boiler_1 haengt an L3, bolier_3
+      # an L1); fuer 08 zaehlt nur "welcher WR speist welchen Stab", und das ist jetzt gemessen.
+      # WARUM PER SERIENNUMMER: Solar Assistant nummeriert inverter_1/2/3 nach Erkennungsreihenfolge —
+      # nach Umstecken/Neustart kann sich der Index aendern (27.09.: inverter_1 = ...4033, 28.09.:
+      # inverter_1 = ...4129). Der Serien-Lookup macht die Zuordnung davon unabhaengig. Ist die
+      # Seriennummer (noch) nicht lesbar, faellt der Sensor auf den bisherigen Index zurueck.
+      - name: "Phase 1 Stabil"
+        unique_id: phase_1_stable
+        device_class: safety
+        delay_on: { seconds: 60 }
+        delay_off: { seconds: 3 }
+        state: >
+          {% set ns = namespace(i=2) %}
+          {% for n in [1, 2, 3] %}
+            {% if is_state('sensor.solarassistant_inverter_' ~ n ~ '_serial_number', 'SERIAL_WR_BOILER_1') %}{% set ns.i = n %}{% endif %}
+          {% endfor %}
+          {% set gp = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_power') | float(0) %}
+          {% set v = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_voltage') | float(0) %}
+          {% if gp <= 100 %}true
+          {% elif this.state == 'on' %}{{ v >= 185 }}
+          {% else %}{{ v >= 190 }}{% endif %}
+      - name: "Phase 2 Stabil"
+        unique_id: phase_2_stable
+        device_class: safety
+        delay_on: { seconds: 60 }
+        delay_off: { seconds: 3 }
+        state: >
+          {% set ns = namespace(i=1) %}
+          {% for n in [1, 2, 3] %}
+            {% if is_state('sensor.solarassistant_inverter_' ~ n ~ '_serial_number', 'SERIAL_WR_BOILER_2') %}{% set ns.i = n %}{% endif %}
+          {% endfor %}
+          {% set gp = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_power') | float(0) %}
+          {% set v = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_voltage') | float(0) %}
+          {% if gp <= 100 %}true
+          {% elif this.state == 'on' %}{{ v >= 185 }}
+          {% else %}{{ v >= 190 }}{% endif %}
+      - name: "Phase 3 Stabil"
+        unique_id: phase_3_stable
+        device_class: safety
+        delay_on: { seconds: 60 }
+        delay_off: { seconds: 3 }
+        state: >
+          {% set ns = namespace(i=3) %}
+          {% for n in [1, 2, 3] %}
+            {% if is_state('sensor.solarassistant_inverter_' ~ n ~ '_serial_number', 'SERIAL_WR_BOLIER_3') %}{% set ns.i = n %}{% endif %}
+          {% endfor %}
+          {% set gp = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_power') | float(0) %}
+          {% set v = states('sensor.solarassistant_inverter_' ~ ns.i ~ '_grid_voltage') | float(0) %}
+          {% if gp <= 100 %}true
+          {% elif this.state == 'on' %}{{ v >= 185 }}
+          {% else %}{{ v >= 190 }}{% endif %}
+
+      # AKKU-ENTLADUNG ANHALTEND (26.06.) — Gate fuers Hochschalten, robust gegen den Einschalt-
+      # Transienten. Ein gerade zugeschalteter Stab zieht kurz aus dem Akku, bis MPPT/PV nachgefuehrt
+      # haben (~20-30 s, vom Nutzer beobachtet) -> dieser kurze Negativ-Zacken ist KEIN Mangel.
+      # delay_on 40 s wartet das Einpendeln ab -> nur ANHALTENDE Entladung wird "on" (= echt kein
+      # Ueberschuss, Hochschalten waere sinnlos). Schwelle -300 W = klar aus dem Akku (ueber Rauschen).
+      # Genutzt vom Hochschalt-Gate (unten) UND von night_lock_off (03) — beide statt des frueheren
+      # Momentan-"bat > -100" (flackerte) bzw. "soc >= 65"-Blanko (schaltete auch bei Entladung hoch).
+      # Werte tunbar (Schwelle/Zeit).
+      - name: "Akku Entladung Anhaltend"
+        unique_id: battery_discharge_sustained
+        delay_on:
+          seconds: 40
+        delay_off:
+          seconds: 10
+        state: >
+          {% set bat = states('sensor.sichere_batterie_leistung') | float(-99999) %}
+          {{ bat != -99999 and bat < -300 }}
+
+      - name: "Heizstab Hochschalten Erlaubt"
+        unique_id: heater_step_up_allowed
+        # FIX (Juni 2026): Zero-Export-Deadlock geloest.
+        # classic_ok = bisherige Logik (gemessene PV-Leistung als Signal).
+        # zero_export_bootstrap_ok = "Sonne da trotz abgeregelter Leistung".
+        # UPDATE (4. Runde, 26.06.2026): Signal von SOC auf MPPT-SPANNUNG umgestellt.
+        #   Frueher: soc >= 70 (Proxy fuer "Akku voll = Ueberschuss"). Problem: der
+        #   SOC-Deckel wandert (75-83 %) wegen UNBALANCIERTER Akku-Straenge -> Proxy
+        #   unzuverlaessig. JETZT: mppt_v > 200 V. Physik: bei Abregelung steigt die
+        #   PV-Spannung Richtung Voc (Tag ~400 V, Nacht ~25 V), waehrend die Leistung
+        #   ~0 ist -> hohe Spannung = Sonne da, egal ob abgeregelt. Gemessen statt geraten,
+        #   robust gegen den SOC-Deckel. (HINWEIS: Der frueher hier genannte "bat > -100"-
+        #   Flacker-Schutz ist seit 26.06. durch akku_entladung_anhaltend ersetzt -> s.
+        #   ANTAST-GATE-Block unten.) 200 V sitzt mittig im leeren Band: per Charts
+        #   22.06.(sonnig)+16.05.(schlecht) ist "Sonne da" IMMER >= ~340 V, "keine Sonne"
+        #   IMMER <= ~50 V. Tunbar. Bootstrap-Zweig MUSS identisch zu night_lock_off in 03 sein.
+        # ANTAST-GATE (26.06., ersetzt den frueheren "(bat > -100 ODER soc >= 65)"-Probe-Start):
+        #   classic_ok UND bootstrap haengen jetzt an "Akku entlaedt NICHT anhaltend"
+        #   (binary_sensor.akku_entladung_anhaltend = off, s. Sensor oben). Damit:
+        #   - kurzer Negativ-Zacken beim Zuschalten (MPPT pendelt ~20-30 s) blockt NICHT (delay_on
+        #     40 s filtert ihn) -> der 1. Stab tastet sich an, auch bei vollem Akku;
+        #   - ANHALTENDE Entladung (echt kein Ueberschuss, Last > PV) sperrt das Hochschalten ->
+        #     kein sinnloses Hochschalten in den Akku-Bezug (Nutzer-Vorgabe 26.06.).
+        #   Loest zugleich das alte Momentan-"bat > -100"-Flackern an der Schwelle.
+        # ============================================================================
+        # ROOT-BUGFIX (26.06.2026): Diese Erklaer-Kommentare standen frueher INNERHALB des
+        #   "state: >"-Blocks. Jinja behandelt "#" NICHT als Kommentar -> der Kommentartext
+        #   landete IM ERGEBNIS ("# Probe-Start ... True") -> HA konnte das nicht als bool
+        #   lesen -> der Sensor war DAUERHAFT "off" -> Hochschalten komplett blockiert; PV-
+        #   Heizen lief nie an (nur der Notlauf, der hochschalten_erlaubt ignoriert). Lehre:
+        #   Kommentare NUR hier oben (vor "state:"), NIEMALS in den Template-Block. Mit
+        #   "yaml.safe_load + Jinja-Render" pruefbar (Literal-Teil darf kein "#" enthalten).
+        # ============================================================================
+        state: >
+          {% set bat = states('sensor.sichere_batterie_leistung') | float(-99999) %}
+          {% set pv = states('sensor.sichere_pv_leistung') | float(-99999) %}
+          {% set pv_pot = states('sensor.pv_potenzial') | float(-99999) %}
+          {% set soc = states('sensor.sicherer_batterie_soc') | float(0) %}
+          {% set mppt_v = states('sensor.sichere_mppt_spannung') | float(0) %}
+          {% set t_oben = states('sensor.sicherer_kessel_oben') | float(50) %}
+          {% set entlaedt = is_state('binary_sensor.akku_entladung_anhaltend', 'on') %}
+          {% set classic_ok = (
+            bat != -99999 and not entlaedt and pv != -99999 and pv_pot > 120 and soc >= 45
+          ) %}
+          {% set zero_export_bootstrap_ok = (
+            bat != -99999 and mppt_v > 200 and not entlaedt
+          ) %}
+          {{ (classic_ok or zero_export_bootstrap_ok) and t_oben < 76
+             and not is_state('input_boolean.heizstab_nachtsperre', 'on')
+             and not is_state('input_boolean.heizstab_sicherheits_sperre', 'on')
+             and not is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+
+      - name: "Heizstab Sicherheit Zwang Aus"
+        unique_id: heater_safety_force_off
+        device_class: safety
+        # Globaler Zwangs-Aus = Notbremse (02 liest ihn, der Status-Text auch): Kessel zu heiss
+        # (79/83), PV-/Akku-Sentinel, Netzspannung instabil oder Watchdog -> alles sofort aus.
+        # AUSNAHME: im NETZ-Notlauf (Notlauf + Netzbezug > 500 W) zaehlt "netzspannung_stabil off"
+        # NICHT, weil dann 08 PER PHASE schuetzt -> der globale MIN-Phasenschutz wuerde sonst die
+        # gesunden Phasen mit abwerfen (alle 3 Staebe). Darum die "und not netz_notlauf"-Klammer.
+        state: >
+          {% set t_oben = states('sensor.sicherer_kessel_oben') | float(50) %}
+          {% set t_mitte = states('sensor.sicherer_kessel_mitte') | float(50) %}
+          {% set bat = states('sensor.sichere_batterie_leistung') | float(-99999) %}
+          {% set pv = states('sensor.sichere_pv_leistung') | float(-99999) %}
+          {% set grid = states('sensor.sichere_netz_leistung') | float(99999) %}
+          {% set netz_notlauf = is_state('binary_sensor.heizstab_notlauf_aktiv', 'on')
+             and (is_state('binary_sensor.netzbetrieb_aktiv', 'on')
+                  or (grid > 500 and grid != 99999)) %}
+          {{ t_oben >= 79 or t_mitte >= 83 or bat == -99999 or pv == -99999
+             or (is_state('binary_sensor.netzspannung_stabil', 'off') and not netz_notlauf)
+             or is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+
+      - name: "Solar Assistant Erreichbar"
+        unique_id: solar_assistant_reachable
+        state: >
+          {{ states('sensor.solarassistant_battery_state_of_charge') not in
+             ['unknown', 'unavailable', 'none'] }}
+
+      # SOLAR-ESTRICH-INDIKATOR (26.06.2026) — NUR Anzeige/Beobachtung, KEINE Steuerwirkung.
+      # Zeigt "jetzt wuerde die Solar-Estrich-Ladung laufen": Heizsaison AN + echter PV-Ueberschuss
+      # (Sonne mppt>200, Akku voll soc>=65, Akku entlaedt NICHT bat>-100) + Speicher oben warm genug
+      # als FBH-Vorlauf (>50, Mischer dahinter) + mind. ein Stockwerk < 21 C (absolute Komfort-Ober-
+      # grenze = KEIN Heizen gegen die Klima im Sommer). Faellt bei jedem Sensorausfall auf AUS
+      # (alle Defaults konservativ). Sonne-Gate => laeuft nie nachts => kann nie Netzlast verursachen.
+      # Zum LIVE-Beobachten im Herbst, BEVOR die eigentliche Steuerung (in 05) scharf geschaltet wird.
+      - name: "Solar Estrich Moeglich"
+        unique_id: solar_screed_charge_possible
+        icon: mdi:heating-coil
+        delay_on:
+          minutes: 2
+        delay_off:
+          seconds: 30
+        state: >
+          {% set mppt_v = states('sensor.sichere_mppt_spannung') | float(0) %}
+          {% set soc = states('sensor.sicherer_batterie_soc') | float(0) %}
+          {% set bat = states('sensor.sichere_batterie_leistung') | float(-99999) %}
+          {% set t_oben = states('sensor.sicherer_kessel_oben') | float(50) %}
+          {% set og2 = states('sensor.durchschnittstemperatur_og2') | float(99) %}
+          {% set og3 = states('sensor.durchschnittstemperatur_og3') | float(99) %}
+          {% set eg = states('sensor.shelly_blu_h_t_b414_temperatur') | float(99) %}
+          {{ is_state('input_boolean.heizsaison', 'on')
+             and mppt_v > 200 and soc >= 65 and bat != -99999 and bat > -100
+             and t_oben > 50
+             and (og2 < 21 or og3 < 21 or eg < 21) }}

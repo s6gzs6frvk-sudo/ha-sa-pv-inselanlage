@@ -1,0 +1,148 @@
+# =============================================================================
+# Ebene C-Netz — NETZ-NOTLAUF PER PHASE (Bruder-Entwurf, 5. Runde 26.06.2026)
+# =============================================================================
+# Heizt im Notlauf AUS DEM NETZ, aber jede Phase EINZELN: 1 Stab pro Wechselrichter/Phase (gemessene
+# Zuordnung s. unten: boiler_1=L3, boiler_2=L2, bolier_3=L1). Bricht eine Phase ein (< 185 V, 3 s),
+# wird NUR DEREN Stab abgeworfen — die gesunden Phasen heizen weiter. Eine Phase darf
+# erst wieder, wenn sie 60 s >= 190 V liegt (Hysterese steckt in phase_X_stabil in 00).
+#
+# OWNERSHIP: Diese Automation besitzt die Relais NUR, wenn (Notlauf UND am Netz: netzbetrieb_aktiv
+# ODER Netzbezug > 500 W).
+# Sonst haelt sie sich komplett raus -> die normale Aktorik 04 steuert (die haelt sich
+# umgekehrt im Netz-Notlauf raus, via netz_notlauf-Variable). So kein Switch-Konflikt.
+#
+# ZUORDNUNG (28.09.2026 GEMESSEN, ersetzt die alte Annahme "boiler_1 = WR 1"): phase_1_stabil (00)
+# ueberwacht den WR, der boiler_1 speist (Serie ...4109, Netz-L3), phase_2_stabil den WR von
+# boiler_2 (...4129, L2), phase_3_stabil den WR von bolier_3 (...4033, L1). Die Sensoren in 00
+# finden den richtigen Solar-Assistant-Index per Seriennummer, unabhaengig von der Steckreihenfolge.
+
+alias: "Heizstab Netz-Notlauf Per-Phase"
+description: "Netz-Backup-Heizen pro Phase: schwache Phase faellt einzeln raus, gesunde heizen weiter."
+mode: restart
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.phase_1_stabil
+      - binary_sensor.phase_2_stabil
+      - binary_sensor.phase_3_stabil
+      - binary_sensor.heizstab_notlauf_aktiv
+      - input_boolean.heizstab_sicherheits_sperre
+      - input_boolean.heizstab_watchdog_sperre
+      - sensor.sicherer_kessel_mitte
+      - sensor.sicherer_kessel_oben
+  - trigger: time_pattern
+    minutes: "/1"
+variables:
+  grid_p: "{{ states('sensor.sichere_netz_leistung') | float(99999) }}"
+  notlauf: "{{ is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') }}"
+  # Netz-Notlauf-Kontext = diese Automation besitzt die Relais.
+  # WINTERPAKET (28.09.2026): "am Netz" = binary_sensor.netzbetrieb_aktiv (WR-Modus "Grid" ODER
+  # Netzbezug > 500 W, in 00) plus der alte 500-W-Weg als Fallback. Vorher griff 08 bei Grundlast
+  # (~290 W am Netz) erst, nachdem 04 den ersten Stab gesetzt hatte; jetzt sofort und direkt per Phase.
+  grid_ctx: >-
+    {{ notlauf and (is_state('binary_sensor.netzbetrieb_aktiv', 'on')
+       or (grid_p > 500 and grid_p != 99999)) }}
+  sperre: >-
+    {{ is_state('input_boolean.heizstab_sicherheits_sperre', 'on')
+       or is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+  t_oben: "{{ states('sensor.sicherer_kessel_oben') | float(50) }}"
+  t_mitte: "{{ states('sensor.sicherer_kessel_mitte') | float(50) }}"
+  blockiert: "{{ sperre or t_oben >= 79 or t_mitte >= 83 }}"
+  p1: "{{ is_state('binary_sensor.phase_1_stabil', 'on') }}"
+  p2: "{{ is_state('binary_sensor.phase_2_stabil', 'on') }}"
+  p3: "{{ is_state('binary_sensor.phase_3_stabil', 'on') }}"
+actions:
+  # 1) Nicht im Netz-Notlauf-Kontext -> Relais gehoeren der Aktorik 04, hier NICHTS tun.
+  - if:
+      - condition: template
+        value_template: "{{ not grid_ctx }}"
+    then:
+      - stop: "Kein Netz-Notlauf (Akku/PV oder kein Netzbezug) -> 04 steuert."
+
+  # 2) Im Kontext, aber global blockiert (Sperre / Kessel zu heiss) -> alle Staebe aus.
+  - if:
+      - condition: template
+        value_template: "{{ blockiert }}"
+    then:
+      - action: switch.turn_off
+        target:
+          entity_id: [switch.boiler_1, switch.boiler_2, switch.bolier_3]
+        continue_on_error: true
+      - stop: "Netz-Notlauf, aber blockiert (Sperre/Temp) -> alles aus."
+
+  # 3) Per-Phase: zuerst SOFORT die schwachen Phasen abwerfen (kein Delay).
+  - if:
+      - condition: template
+        value_template: "{{ not p1 }}"
+    then:
+      - action: switch.turn_off
+        target: { entity_id: switch.boiler_1 }
+        continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ not p2 }}"
+    then:
+      - action: switch.turn_off
+        target: { entity_id: switch.boiler_2 }
+        continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ not p3 }}"
+    then:
+      - action: switch.turn_off
+        target: { entity_id: switch.bolier_3 }
+        continue_on_error: true
+
+  # 3b) AUTO-OFF-REFRESH (3.7.2026, PDF-Befund H1 verifiziert): LAUFENDE Staebe auf gesunden
+  #     Phasen erneut bestaetigen (turn_on = Shelly-5-min-Timer-Reset, idempotent, KEIN Delay).
+  #     Ohne das schaltete 08 nur Staebe zu, die "off" sind -> ein laufender Stab fiel alle
+  #     5 min dem Shelly-Auto-Off zum Opfer und wurde erst vom naechsten /1min-Tick
+  #     zurueckgeholt (Heizluecken + sinnlose Relais-Zyklen die ganze Winternacht).
+  #     Pendant zum Auto-Off-Refresh in 04 (dort fuer den PV-Betrieb).
+  - if:
+      - condition: template
+        value_template: "{{ p1 and is_state('switch.boiler_1', 'on') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.boiler_1 }
+        continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ p2 and is_state('switch.boiler_2', 'on') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.boiler_2 }
+        continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ p3 and is_state('switch.bolier_3', 'on') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.bolier_3 }
+        continue_on_error: true
+
+  # 4) Gesunde Phasen zuschalten — gestaffelt 10 s (Netz nicht mit einem Schlag belasten).
+  #    Nur zuschalten, wenn der Stab noch aus ist (kein unnoetiges Re-Delay).
+  - if:
+      - condition: template
+        value_template: "{{ p1 and is_state('switch.boiler_1', 'off') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.boiler_1 }
+        continue_on_error: true
+      - delay: "00:00:10"
+  - if:
+      - condition: template
+        value_template: "{{ p2 and is_state('switch.boiler_2', 'off') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.boiler_2 }
+        continue_on_error: true
+      - delay: "00:00:10"
+  - if:
+      - condition: template
+        value_template: "{{ p3 and is_state('switch.bolier_3', 'off') }}"
+    then:
+      - action: switch.turn_on
+        target: { entity_id: switch.bolier_3 }
+        continue_on_error: true

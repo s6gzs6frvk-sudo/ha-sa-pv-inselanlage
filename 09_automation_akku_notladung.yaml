@@ -1,0 +1,154 @@
+# =============================================================================
+# Ebene A-Schutz — AKKU-NOTLADUNG (Winterpaket 28.09.2026, Nutzer-Entscheid)
+# =============================================================================
+# Ladequelle der WR steht auf OSO (Only Solar): das Netz laedt den Akku NIE. Am Netz zieht der WR
+# seinen Eigenbedarf aber teilweise aus dem Akku (~50-80 W je Geraet, 1-2 kWh/Nacht). Nach dem
+# Netzwechsel bei 49,0 V (~10 %, F2-05 seit 28.09. abends) driftet der Akku bei schneebedeckten Modulen Nacht fuer Nacht
+# weiter Richtung BMS-Abschaltung (41,5 V) -> Parallelsystem ohne Akku kann in Fehler gehen ->
+# Haus dunkel trotz Netz. Diese Automation ist die EINZIGE Ausnahme von "kein Netzstrom in den Akku":
+#
+#   EIN:  niedrigste WR-Akkuspannung 30 min < 48,5 V UND am Netz UND mind. ein WR auf OSO
+#         -> alle 3 WR auf "Solar first (SOF)" (Netz laedt nur, wenn keine Sonne = nachts).
+#   AUS:  niedrigste WR-Akkuspannung 15 min >= 51,5 V (oder alle 10 min nachgeprueft)
+#         UND mind. ein WR auf SOF -> alle 3 zurueck auf "Solar only (OSO)".
+#
+# 48,5 V liegt 0,5 V unter dem Netzwechsel (49,0 V, Ruhe danach ~49,6 V): normale Netznaechte loesen
+# NICHT aus, nur echtes Wegdriften. 51,5 V liegt 1,5 V unter F2-06 (53,0 V, 28.09. abends bestaetigt):
+# der WR bleibt waehrend der Notladung am Netz, kein Pendeln; HA setzt spaetestens 15 min nach
+# Erreichen von 51,5 V auf OSO zurueck.
+# Erwartung: wenige Ereignisse pro Winter, je ~2-4 kWh aus dem Netz. Die Option-Strings stammen
+# aus der HA-Aufzeichnung 28.09. ("Solar first (SOF)", "Solar only (OSO)").
+#
+# POLITIK: OSO ist der Normalzustand. Steht ein WR auf SOF und der Akku ist >= 51,5 V, setzt diese
+# Automation OSO zurueck — auch nach einem manuellen Umstellen. Wer SOF dauerhaft will, deaktiviert
+# diese Automation. Schreibzugriff nur, wenn Solar Assistant erreichbar ist und die Spannungen
+# gueltig sind. Jede Umschaltung erzeugt eine Benachrichtigung in HA.
+
+alias: "Akku Notladung"
+description: "OSO-Ausnahme: Akku am Netz unter 48,5 V -> Netz laedt (SOF) bis 51,5 V, dann zurueck auf OSO."
+triggers:
+  - trigger: template
+    value_template: >-
+      {% set ns = namespace(v=[]) %}
+      {% for e in ['sensor.solarassistant_inverter_1_battery_voltage',
+                   'sensor.solarassistant_inverter_2_battery_voltage',
+                   'sensor.solarassistant_inverter_3_battery_voltage'] %}
+        {% set x = states(e) | float(-1) %}
+        {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+      {% endfor %}
+      {{ (ns.v | count) > 0 and (ns.v | min) < 48.5 }}
+    for: "00:30:00"
+    id: leer
+  - trigger: template
+    value_template: >-
+      {% set ns = namespace(v=[]) %}
+      {% for e in ['sensor.solarassistant_inverter_1_battery_voltage',
+                   'sensor.solarassistant_inverter_2_battery_voltage',
+                   'sensor.solarassistant_inverter_3_battery_voltage'] %}
+        {% set x = states(e) | float(-1) %}
+        {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+      {% endfor %}
+      {{ (ns.v | count) > 0 and (ns.v | min) >= 51.5 }}
+    for: "00:15:00"
+    id: voll
+  - trigger: time_pattern
+    minutes: "/10"
+    id: check
+variables:
+  bat_v: >-
+    {% set ns = namespace(v=[]) %}
+    {% for e in ['sensor.solarassistant_inverter_1_battery_voltage',
+                 'sensor.solarassistant_inverter_2_battery_voltage',
+                 'sensor.solarassistant_inverter_3_battery_voltage'] %}
+      {% set x = states(e) | float(-1) %}
+      {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+    {% endfor %}
+    {{ (ns.v | min) if (ns.v | count) > 0 else -1 }}
+  sa_ok: "{{ is_state('binary_sensor.solar_assistant_erreichbar', 'on') }}"
+  am_netz: >-
+    {% set grid = states('sensor.sichere_netz_leistung') | float(99999) %}
+    {{ is_state('binary_sensor.netzbetrieb_aktiv', 'on') or (grid > 500 and grid != 99999) }}
+  ein_oso: >-
+    {{ is_state('select.solarassistant_inverter_1_charger_source_priority', 'Solar only (OSO)')
+       or is_state('select.solarassistant_inverter_2_charger_source_priority', 'Solar only (OSO)')
+       or is_state('select.solarassistant_inverter_3_charger_source_priority', 'Solar only (OSO)') }}
+  ein_sof: >-
+    {{ is_state('select.solarassistant_inverter_1_charger_source_priority', 'Solar first (SOF)')
+       or is_state('select.solarassistant_inverter_2_charger_source_priority', 'Solar first (SOF)')
+       or is_state('select.solarassistant_inverter_3_charger_source_priority', 'Solar first (SOF)') }}
+actions:
+  - choose:
+      # EIN: Akku leer am Netz -> Netz darf laden.
+      - conditions:
+          - condition: trigger
+            id: leer
+          - condition: template
+            value_template: "{{ sa_ok and bat_v > 0 and bat_v < 48.5 and am_netz and ein_oso }}"
+        sequence:
+          - action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id:
+                - select.solarassistant_inverter_1_charger_source_priority
+                - select.solarassistant_inverter_2_charger_source_priority
+                - select.solarassistant_inverter_3_charger_source_priority
+            data:
+              option: "Solar first (SOF)"
+          # NACHWEIS (Audit 28.09.2026 abends): bis 60 s warten, ob alle drei WR den Wechsel bestaetigen.
+          # Vorher meldete die Benachrichtigung "EIN", auch wenn der Schreibzugriff still gescheitert war
+          # (SA nicht erreichbar, Option umbenannt). Jetzt: bestaetigt -> EIN, sonst FEHLGESCHLAGEN mit
+          # Handlungsanweisung. Push aufs Handy macht Automation 11 (Trigger auf die select-Entitaeten).
+          - wait_template: >-
+              {{ is_state('select.solarassistant_inverter_1_charger_source_priority', 'Solar first (SOF)')
+                 and is_state('select.solarassistant_inverter_2_charger_source_priority', 'Solar first (SOF)')
+                 and is_state('select.solarassistant_inverter_3_charger_source_priority', 'Solar first (SOF)') }}
+            timeout: "00:01:00"
+            continue_on_timeout: true
+          - action: persistent_notification.create
+            data:
+              notification_id: akku_notladung
+              title: "{{ 'Akku-Notladung EIN' if wait.completed else 'Akku-Notladung FEHLGESCHLAGEN' }}"
+              message: >-
+                {% if wait.completed %}Akku am Netz bei {{ bat_v }} V (30 min unter 48,5 V). Ladequelle auf SOF
+                gestellt, das Netz laedt bis 51,5 V, dann automatisch zurueck auf OSO.
+                {% else %}Akku am Netz bei {{ bat_v }} V, aber die WR haben SOF nach 60 s NICHT bestaetigt
+                (WR1: {{ states('select.solarassistant_inverter_1_charger_source_priority') }}). Bitte in
+                Solar Assistant von Hand auf "Solar first" stellen, sonst laeuft der Akku weiter leer.
+                {% endif %}{{ now().strftime('%d.%m. %H:%M') }}
+      # AUS: Akku wieder ueber 51,5 V -> zurueck auf OSO (per Flanke ODER 10-min-Nachpruefung).
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: voll
+              - condition: trigger
+                id: check
+          - condition: template
+            value_template: "{{ sa_ok and bat_v >= 51.5 and ein_sof }}"
+        sequence:
+          - action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id:
+                - select.solarassistant_inverter_1_charger_source_priority
+                - select.solarassistant_inverter_2_charger_source_priority
+                - select.solarassistant_inverter_3_charger_source_priority
+            data:
+              option: "Solar only (OSO)"
+          - wait_template: >-
+              {{ is_state('select.solarassistant_inverter_1_charger_source_priority', 'Solar only (OSO)')
+                 and is_state('select.solarassistant_inverter_2_charger_source_priority', 'Solar only (OSO)')
+                 and is_state('select.solarassistant_inverter_3_charger_source_priority', 'Solar only (OSO)') }}
+            timeout: "00:01:00"
+            continue_on_timeout: true
+          - action: persistent_notification.create
+            data:
+              notification_id: akku_notladung
+              title: "{{ 'Akku-Notladung AUS' if wait.completed else 'Akku-Notladung: Rueckstellung FEHLGESCHLAGEN' }}"
+              message: >-
+                {% if wait.completed %}Akku bei {{ bat_v }} V, Ladequelle zurueck auf OSO.
+                {% else %}Akku bei {{ bat_v }} V, aber die WR haben OSO nach 60 s NICHT bestaetigt
+                (WR1: {{ states('select.solarassistant_inverter_1_charger_source_priority') }}). Bitte in
+                Solar Assistant von Hand auf "Solar only" stellen, sonst laedt das Netz weiter.
+                {% endif %}{{ now().strftime('%d.%m. %H:%M') }}
+mode: single

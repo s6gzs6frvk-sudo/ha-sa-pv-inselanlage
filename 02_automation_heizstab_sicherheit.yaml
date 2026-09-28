@@ -1,0 +1,149 @@
+# =============================================================================
+# Ebene B+C — Heizstab SICHERHEIT (höchste Priorität)
+# =============================================================================
+# Schaltet bei Gefahr: Sperre an, Soll-Stufe 0. Keine PV-/Komfort-Logik hier.
+# Entlastet 03 (Entscheidung) — läuft nur, wenn keine Sicherheits-Sperre aktiv ist.
+
+alias: "Heizstab Sicherheit"
+description: "Temp/Panik/Netz/Batterie/Watchdog (SA offline) — Sperre + Soll-Stufe 0."
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.heizstab_sicherheit_zwang_aus
+    to: "on"
+    id: sicherheit_ein
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sichere_batterie_leistung') | float(0) <= -9000
+      and states('sensor.sichere_batterie_leistung') | float(0) != -99999 }}
+    for: "00:00:02"
+    id: bat_9kw_hard
+  # grid_high wirft Heizen ab, wenn es aus dem Netz zieht (> 1000 W) — ABER NICHT im Notlauf:
+  # dort darf bewusst aus dem Netz geheizt werden (1000-L-Kessel kalt). Schutz uebernimmt dann
+  # die Phasenspannung (netzspannung_stabil, < 185 V -> raus). Ausserhalb Notlauf bleibt der
+  # 1000-W-Netzschutz hart (kein Netz-Heizen im Normalbetrieb).
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sichere_netz_leistung') | float(99999) > 1000
+      and not is_state('binary_sensor.heizstab_notlauf_aktiv', 'on') }}
+    for: "00:00:15"
+    id: grid_high
+  - trigger: template
+    value_template: >-
+      {{ is_state('binary_sensor.heizstab_sicherheit_zwang_aus', 'off')
+      and states('sensor.sichere_netz_leistung') | float(99999) <= 1000
+      and (states('sensor.sichere_batterie_leistung') | float(0) > -9000
+           or states('sensor.sichere_batterie_leistung') | float(0) == -99999)
+      and not is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+    for: "00:02:00"
+    id: alles_ok
+  # ENTSPERR-SELBSTHEILUNG (3.7.2026, aus Live-Ausfall 30.6.-3.7. belegt): alles_ok ist ein
+  # FLANKEN-Trigger — passiert der schlecht->gut-Uebergang waehrend des HA-Boots (Race:
+  # Template-Sensoren initialisieren, bevor die Automation zuhoert), wird die Flanke VERPASST
+  # und die Sperre bleibt fuer immer haengen (Feld-Beleg: zwang_aus 2 Tage off, 3 Neustarts,
+  # Sperre blieb an -> System tot). Daher zusaetzlich alle 5 min per Zeitplan pruefen; die
+  # Bedingungen werden im choose-Zweig erneut verifiziert, inkl. "zwang_aus seit >= 2 min off"
+  # (last_changed ersetzt das for: der Flanke). Gleiche Bug-Klasse + Loesung wie die
+  # Nachtsperre-Selbstheilung in 03.
+  - trigger: time_pattern
+    minutes: /5
+    id: unlock_check
+  # WATCHDOG (28.09.2026, aus der frueheren Datei 06 hierher verschoben, Funktion unveraendert):
+  # Solar Assistant > 5 min nicht erreichbar -> eigene Watchdog-Sperre + Soll 0 (Status-Text nennt
+  # dann "Watchdog"); wieder erreichbar (2 min stabil) -> Watchdog-Sperre aus. Die Watchdog-Sperre
+  # bleibt ein eigener Helfer (input_boolean.heizstab_watchdog_sperre), damit die Ursache sichtbar ist.
+  - trigger: state
+    entity_id: binary_sensor.solar_assistant_erreichbar
+    to: "off"
+    for: "00:05:00"
+    id: sa_offline
+  - trigger: state
+    entity_id: binary_sensor.solar_assistant_erreichbar
+    to: "on"
+    for: "00:02:00"
+    id: sa_online
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: sa_offline
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.heizstab_watchdog_sperre
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.heizstab_soll_stufe
+            data:
+              value: 0
+      - conditions:
+          - condition: trigger
+            id: sa_online
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.heizstab_watchdog_sperre
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: sicherheit_ein
+              - condition: trigger
+                id: bat_9kw_hard
+              - condition: trigger
+                id: grid_high
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.heizstab_sicherheits_sperre
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.heizstab_soll_stufe
+            data:
+              value: 0
+          # Cooldown-Zeitstempel NUR bei harten Akku-/Netz-Abwuerfen (bat_9kw_hard/grid_high),
+          # wie urspruenglich dokumentiert. FIX (3.7.2026, PDF-Befund H3 verifiziert): frueher
+          # stempelte auch sicherheit_ein (= zwang_aus an) — zwang_aus geht aber bei JEDEM
+          # HA-Neustart kurz an (Sensoren booten, netzspannung_stabil braucht 60 s delay_on)
+          # -> jeder Neustart fror die Notlauf-Rampe 10 min ein (cooldown_ok gated emergency).
+          # Temp-/Sentinel-Abwuerfe brauchen keinen Cooldown: Temp regelt sich ueber die
+          # Hysterese, Sentinel ueber die Sperre selbst.
+          - if:
+              - condition: trigger
+                id:
+                  - bat_9kw_hard
+                  - grid_high
+            then:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.letzter_heizstab_abwurf
+                data:
+                  timestamp: "{{ as_timestamp(now()) }}"
+      # Entsperren: per Flanke (alles_ok) ODER per 5-min-Selbstheilung (unlock_check).
+      # Beim unlock_check werden ALLE alles_ok-Bedingungen hier erneut geprueft — inkl.
+      # "zwang_aus seit >= 2 min stabil off" (last_changed), damit die Heartbeat-Route
+      # dieselbe 2-min-Stabilitaet verlangt wie die for:-Flanke. Kein vorschnelles Entsperren.
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: alles_ok
+              - condition: trigger
+                id: unlock_check
+          - condition: state
+            entity_id: input_boolean.heizstab_sicherheits_sperre
+            state: "on"
+          - condition: template
+            value_template: >-
+              {{ is_state('binary_sensor.heizstab_sicherheit_zwang_aus', 'off')
+              and states.binary_sensor.heizstab_sicherheit_zwang_aus is not none
+              and (now() - states.binary_sensor.heizstab_sicherheit_zwang_aus.last_changed).total_seconds() > 120
+              and states('sensor.sichere_netz_leistung') | float(99999) <= 1000
+              and (states('sensor.sichere_batterie_leistung') | float(0) > -9000
+                   or states('sensor.sichere_batterie_leistung') | float(0) == -99999)
+              and not is_state('input_boolean.heizstab_watchdog_sperre', 'on') }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.heizstab_sicherheits_sperre
+mode: queued
+max: 5

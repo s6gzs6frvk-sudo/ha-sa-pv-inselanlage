@@ -1,0 +1,166 @@
+# =============================================================================
+# Heizungspumpen — Pumpen + Kessel-Abfuhr-Helfer + Thermostate OG2/OG3
+# =============================================================================
+# Abfuhr: >70 °C 2 min → Helfer an; <68 °C 5 min → aus (sicherer Kessel).
+# Thermostate nur bei Besuch/Abfuhr/HA-Start/Leerstand-Soll-Aenderung — nicht bei jedem Temperatur-Tick.
+# Leerstand-Soll = input_number.leerstand_soll (Winterpaket 28.09.2026; Default 17, Nutzer im Winter 12).
+# Hydraulik: Nur EG-Bedarf → boiler_hot 28/32 °C (sonst OG-Pfad 32/38 bzw. 35/42).
+# Pumpen-Cooldown: 10 min zwischen Schaltvorgängen (FBH träge).
+# Raum-Hysterese: 0,5 °C (statt 0,3 — weniger Flattern bei BLE/Tuya).
+
+alias: "Heizungspumpen"
+description: "Pumpen OG/EG, Abfuhr-Helfer, Thermostat-Soll OG2/OG3."
+triggers:
+  - trigger: state
+    id: raeume
+    entity_id:
+      - sensor.shelly_blu_h_t_b414_temperatur
+      - sensor.durchschnittstemperatur_og2
+      - sensor.durchschnittstemperatur_og3
+  - trigger: state
+    id: besuch
+    entity_id:
+      - input_boolean.besuch_eg
+      - input_boolean.besuch_2s
+      - input_boolean.besuch_3s
+      - input_boolean.kessel_abfuhr_komfort
+  # WINTERPAKET (28.09.2026): Leerstand-Raumsoll ist jetzt der Helfer input_number.leerstand_soll
+  # (Nutzer: Winter 12 C Frostschutz, sonst 17 C). Aenderung am Helfer -> Thermostate sofort neu setzen.
+  - trigger: state
+    id: leerstand
+    entity_id: input_number.leerstand_soll
+  # DAUERHAFTES NACHSETZEN (28.09.2026, Nutzer-Wunsch): Thermostate/Wanddisplays verstellen sich
+  # (Bedienung vor Ort, Stromausfall, Geraete-Reset). Alle 30 min werden die Sollwerte neu gesetzt;
+  # set_temperature ist idempotent. Manuelle Aenderungen werden damit bewusst UEBERSCHRIEBEN.
+  - trigger: time_pattern
+    minutes: "/30"
+    id: sync
+  - trigger: state
+    id: kessel_shelly
+    entity_id:
+      - sensor.shelly1pmg4_e4b0637a7e74_temperatur_2
+      - sensor.shelly1pmg4_e4b0637a7e74_temperatur_3
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sicherer_kessel_oben') | float(0) > 70
+      and states('sensor.sicherer_kessel_mitte') | float(0) > 70 }}
+    for: "00:02:00"
+    id: abfuhr_ein
+  - trigger: template
+    value_template: >-
+      {{ states('sensor.sicherer_kessel_oben') | float(0) < 68
+      or states('sensor.sicherer_kessel_mitte') | float(0) < 68 }}
+    for: "00:05:00"
+    id: abfuhr_aus
+  - trigger: homeassistant
+    id: ha_start
+    event: start
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: abfuhr_ein
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.kessel_abfuhr_komfort
+      - conditions:
+          - condition: trigger
+            id: abfuhr_aus
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.kessel_abfuhr_komfort
+  - if:
+      - condition: template
+        value_template: >
+          {{ trigger.id | default('', true) | string in
+          ['besuch', 'abfuhr_ein', 'abfuhr_aus', 'ha_start', 'leerstand', 'sync'] }}
+    then:
+      - action: climate.set_temperature
+        continue_on_error: true
+        data:
+          temperature: >-
+            {{ 21 if is_state('input_boolean.besuch_2s', 'on')
+            or is_state('input_boolean.kessel_abfuhr_komfort', 'on')
+            else states('input_number.leerstand_soll') | float(17) }}
+        target:
+          entity_id:
+            - climate.wohnzimmer
+            - climate.kinderzimmer
+            - climate.bad_flur
+      - action: climate.set_temperature
+        continue_on_error: true
+        data:
+          temperature: >-
+            {{ 21 if is_state('input_boolean.besuch_3s', 'on')
+            or is_state('input_boolean.kessel_abfuhr_komfort', 'on')
+            else states('input_number.leerstand_soll') | float(17) }}
+        target:
+          entity_id:
+            - climate.shellywalldisplay_00a90b53f2d5
+            - climate.shellywalldisplay_00082256e8b8
+            - climate.shellywalldisplay_0008221c2dcc
+            - climate.shellywalldisplay_00082273ad2f
+  - if:
+      - condition: template
+        value_template: >
+          {% set change = states('switch.pumpen') != ziel_haupt or
+          states('switch.shelly1minig4_ccba97c02fc8') != ziel_eg %} {{ change
+          and (cooldown_ok or kessel_voll) }}
+    then:
+      - action: switch.turn_{{ ziel_haupt }}
+        target:
+          entity_id: switch.pumpen
+        continue_on_error: true
+      - wait_template: >-
+          {{ states('switch.shelly1minig4_ccba97c02fc8') not in ['unavailable',
+          'unknown'] }}
+        timeout: "00:00:30"
+        continue_on_timeout: true
+      - action: switch.turn_{{ ziel_eg }}
+        target:
+          entity_id: switch.shelly1minig4_ccba97c02fc8
+        continue_on_error: true
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.letzter_pumpen_schaltvorgang
+        data:
+          timestamp: "{{ as_timestamp(now()) }}"
+mode: restart
+variables:
+  temp_og2: "{{ states('sensor.durchschnittstemperatur_og2') | float(99) }}"
+  temp_og3: "{{ states('sensor.durchschnittstemperatur_og3') | float(99) }}"
+  soll_og2: "{{ states('sensor.durchschnitts_sollwert_og2') | float(17) }}"
+  soll_og3: "{{ states('sensor.durchschnitts_sollwert_og3') | float(17) }}"
+  bedarf_eg: >
+    {% set tid = trigger.id | default('', true) | string %}
+    {% set t = states('sensor.shelly_blu_h_t_b414_temperatur') | float(99) %}
+    {% set abfuhr = ((is_state('input_boolean.kessel_abfuhr_komfort', 'on')) or
+    (tid == 'abfuhr_ein')) and (tid != 'abfuhr_aus') %}
+    {% set s = 21 if (is_state('input_boolean.besuch_eg', 'on') or abfuhr) else
+    states('input_number.leerstand_soll') | float(17) %}
+    {{ t <= s + 0.5 if is_state('switch.shelly1minig4_ccba97c02fc8', 'on')
+    else t < s - 0.5 }}
+  bedarf_oben: >
+    {% set b2 = temp_og2 <= soll_og2 + 0.5 if is_state('switch.pumpen', 'on')
+    else temp_og2 < soll_og2 - 0.5 %} {% set b3 = temp_og3 <= soll_og3 + 0.5 if
+    is_state('switch.pumpen', 'on') else temp_og3 < soll_og3 - 0.5 %} {{ b2 or
+    b3 }}
+  t_mitte: "{{ states('sensor.sicherer_kessel_mitte') | float(50) }}"
+  t_oben: "{{ states('sensor.sicherer_kessel_oben') | float(50) }}"
+  boiler_hot: |-
+    {% if bedarf_eg and not bedarf_oben %}
+      {# Nur EG: etwas lauwarm reicht, damit EG nicht „hängen bleibt“ unter 32/38 #}
+      {{ t_mitte > 28 and t_oben > 32 }}
+    {% else %}
+      {{ t_mitte > 32 and t_oben > 38 if is_state('switch.pumpen', 'on') else
+      t_mitte > 35 and t_oben > 42 }}
+    {% endif %}
+  kessel_voll: "{{ t_oben > 70 and t_mitte > 70 }}"
+  ziel_haupt: >-
+    {{ 'on' if (kessel_voll or ((bedarf_oben or bedarf_eg) and boiler_hot)) else
+    'off' }}
+  ziel_eg: "{{ 'on' if (kessel_voll or (bedarf_eg and boiler_hot)) else 'off' }}"
+  last_switch: "{{ as_timestamp(states('input_datetime.letzter_pumpen_schaltvorgang'), 0) }}"
+  cooldown_ok: "{{ (as_timestamp(now()) - last_switch) > 600 }}"

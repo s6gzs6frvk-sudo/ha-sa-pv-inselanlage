@@ -1,0 +1,124 @@
+# =============================================================================
+# Helper-Entitäten — ha-smart-energy Paket
+# =============================================================================
+# UI: Einstellungen → Geräte & Dienste → Helfer (Einbau-Details: AGENT_KONTEXT.md Abschnitt 11)
+#
+# heizstab_soll_stufe: Ziel 0–3 — von 03 (Entscheidung) geschrieben, von 04 (Aktorik) umgesetzt
+# heizstab_sicherheits_sperre: von 02 (Sicherheit) — blockiert 03
+# heizstab_watchdog_sperre: von 06 (Watchdog) — SA offline
+# heizstab_nachtsperre: von 03 — blockiert nur PV-Hochschalten
+
+input_boolean:
+  heizstab_nachtsperre:
+    name: Heizstab Nachtsperre
+    icon: mdi:weather-night
+    initial: false
+  heizstab_sicherheits_sperre:
+    name: Heizstab Sicherheits Sperre
+    icon: mdi:shield-alert
+    initial: false
+  heizstab_watchdog_sperre:
+    name: Heizstab Watchdog Sperre
+    icon: mdi:heart-pulse
+    initial: false
+  # SOLAR-ESTRICH (26.06.2026): Saison-Schalter fuer die "Solar-Estrich-Ladung" (PV-Ueberschuss
+  # in den Fussboden parken). Bewusst MANUELL + Default AUS: im Sommer GARANTIERT inaktiv (kein
+  # Heizen gegen die Klimaanlage). Im Herbst einschalten. Solange aus, tut die ganze Funktion nichts.
+  heizsaison:
+    name: Heizsaison (Solar-Estrich-Ladung erlauben)
+    icon: mdi:sun-snowflake-variant
+    initial: false
+  # PUMPEN-/KOMFORT-HELFER (seit Juni in HA per UI angelegt, hier 28.09. nachgetragen, damit die
+  # Referenz vollstaendig ist). besuch_* = Stockwerk-Flags (EG / 2. Stock / 3. Stock): 2-3 Tage
+  # vor Ankunft AN -> 21 C + Notlauf 50 C (Kesselmitte, Warmwasser); beim Verlassen AUS. kessel_abfuhr_komfort setzt 05
+  # automatisch (Kessel > 70 C), nicht von Hand bedienen. Alle OHNE "initial" (Zustand bleibt).
+  besuch_eg:
+    name: Besuch EG
+    icon: mdi:home-floor-0
+  besuch_2s:
+    name: Besuch 2. Stock
+    icon: mdi:home-floor-2
+  besuch_3s:
+    name: Besuch 3. Stock
+    icon: mdi:home-floor-3
+  kessel_abfuhr_komfort:
+    name: Kessel Abfuhr Komfort
+    icon: mdi:water-boiler
+
+input_number:
+  # WINTERPAKET (28.09.2026): Raum-Soll im LEERSTAND, vom Nutzer waehlbar (Frostschutz-Stufe).
+  # Ersetzt die feste 17 in 05 (Thermostate OG2/OG3 + EG-Bedarf). OHNE "initial" -> Wert bleibt
+  # ueber Neustarts; solange nie gesetzt, faellt 05 per float(17) auf 17 zurueck. Nutzer-Entscheid:
+  # Winter-Leerstand 12 C (Frostschutz Leitungen/FBH/Schimmel, spart ~1/3 gegenueber 17 C),
+  # Sommer/Herbst 17 C. Besuch (21 C) hat weiterhin Vorrang.
+  leerstand_soll:
+    name: Leerstand Raumsoll
+    min: 8
+    max: 21
+    step: 0.5
+    mode: box
+    unit_of_measurement: "°C"
+    icon: mdi:home-thermometer-outline
+  heizstab_soll_stufe:
+    name: Heizstab Soll Stufe
+    min: 0
+    max: 3
+    step: 1
+    mode: box
+    icon: mdi:heating-coil
+    initial: 0
+  # FIX (Juni 2026): Betriebsstunden bewusst OHNE "initial". HA setzt ein gesetztes
+  # "initial" bei JEDEM Neustart zurueck und ignoriert den gespeicherten Stand ->
+  # die Rotations-Historie ginge bei jedem Reboot verloren. Ohne "initial" wird der
+  # letzte Wert aus core.restore_state wiederhergestellt. (heizstab_soll_stufe darf
+  # "initial: 0" behalten -> gewollter sicherer Kaltstart.)
+  boiler_1_betriebsstunden:
+    name: Boiler 1 Betriebsstunden
+    min: 0
+    max: 100000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+  boiler_2_betriebsstunden:
+    name: Boiler 2 Betriebsstunden
+    min: 0
+    max: 100000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+  bolier_3_betriebsstunden:
+    name: Bolier 3 Betriebsstunden
+    min: 0
+    max: 100000
+    step: 0.01
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:clock-outline
+
+# Zeitstempel des letzten HARTEN Heizstab-Abwurfs (bat_protect/bat_9kw/grid) — fuer den
+# Hochschalt-Cooldown in 03 (10 min keine Wieder-Anlauf-Versuche). Analog zum bereits
+# existierenden input_datetime.letzter_pumpen_schaltvorgang. WICHTIG: falls die Helfer per
+# UI angelegt sind, diesen dort NEU anlegen (Typ Datum+Uhrzeit), sonst greift der Cooldown
+# nicht (03 nimmt dann konservativ "kein Cooldown" an -> Verhalten wie bisher, kein Fehler).
+input_datetime:
+  letzter_heizstab_abwurf:
+    name: Letzter Heizstab Abwurf
+    has_date: true
+    has_time: true
+    icon: mdi:timer-alert-outline
+  # Zeitstempel des letzten SANFTEN Step-down (bat_low/pv_low/Heartbeat-PV-Aus) — fuer den
+  # Anti-Pendel-Hold in 03 (~5 min kein erneutes PV-Hochschalten). Getrennt vom 10-min-Cooldown
+  # oben, weil sanfter (Solar bleibt reaktiv, nur Antast-Pendeln gebremst). Fehlt er -> "kein Hold".
+  letzter_pv_step_down:
+    name: Letzter PV Step-down
+    has_date: true
+    has_time: true
+    icon: mdi:timer-sand
+  # Pumpen-Cooldown (05), seit Juni per UI angelegt, 28.09. nachgetragen.
+  letzter_pumpen_schaltvorgang:
+    name: Letzter Pumpen Schaltvorgang
+    has_date: true
+    has_time: true
+    icon: mdi:timer-outline

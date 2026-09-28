@@ -1,0 +1,199 @@
+# =============================================================================
+# ALARME AUFS HANDY (Audit 28.09.2026 abends, NEU, optional aber empfohlen)
+# =============================================================================
+# Ferienhaus = niemand vor Ort. Diese Automation meldet die wenigen Zustaende, bei denen jemand
+# reagieren muss, als HA-Benachrichtigung (Glocke) UND per Push auf die Companion-App
+# (notify.notify = alle in HA registrierten Handys). Ohne Companion-App: den letzten Schritt
+# "notify.notify" loeschen, die Glocken-Meldung bleibt (der Schritt wuerde sonst nur einen
+# Fehler ins Protokoll schreiben, die Glocke ist dann schon gesetzt).
+#
+# Meldungen (jede hoechstens einmal pro Ereignis, dank Flanken-Triggern mit Mindestdauer):
+#   akku_kritisch    niedrigste WR-Akkuspannung 10 min < 48,0 V (1 V ueber Hausabschaltung F2-07 47,0)
+#   netz_verweigert  Akku 20 min < 48,8 V, Netzspannung > 170 V liegt an, aber KEIN Netzbetrieb
+#                    -> genau der Fehler vom 18.05. bis 28.09. (WR nahmen das Netz nicht an)
+#   netzausfall      alle drei WR messen 10 min < 100 V am Eingang (Dorfnetz weg); Entwarnung ab > 170 V
+#   sa_offline       Solar Assistant 15 min nicht erreichbar (Watchdog-Sperre, kein Heizen); Entwarnung
+#   sperre_haengt    Sicherheits-Sperre 30 min an (Selbstheilung greift nicht)
+#   kessel_kalt      Kessel mitte 60 min < 15 C (Notlauf schafft es nicht: Staebe/Netz/Sperre pruefen)
+#   raum_kalt        ein Stockwerk 30 min < 8 C (Frostgefahr Leitungen)
+#   notlauf_lang     Notlauf 24 h ununterbrochen an (Ziel nie erreicht)
+#   ladequelle       Ladequelle eines WR geaendert (Notladung EIN/AUS aus 09 oder Handbedienung)
+#   ha_start         HA neu gestartet (Stromausfall/Neustart erkennen)
+# Schwellen bewusst weit weg vom Normalbetrieb: normale Netznaechte (49,0 bis 49,6 V) loesen NICHTS aus.
+
+alias: "Alarme Handy"
+description: "Meldet Akku kritisch, Netz verweigert, Netzausfall, SA offline, Sperre, Kessel/Raum kalt, Ladequelle, HA-Start."
+triggers:
+  - trigger: template
+    id: akku_kritisch
+    value_template: >-
+      {% set ns = namespace(v=[]) %}
+      {% for n in [1, 2, 3] %}
+        {% set x = states('sensor.solarassistant_inverter_' ~ n ~ '_battery_voltage') | float(-1) %}
+        {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+      {% endfor %}
+      {{ (ns.v | count) > 0 and (ns.v | min) < 48.0 }}
+    for: "00:10:00"
+  - trigger: template
+    id: netz_verweigert
+    value_template: >-
+      {% set ns = namespace(v=[], g=[]) %}
+      {% for n in [1, 2, 3] %}
+        {% set x = states('sensor.solarassistant_inverter_' ~ n ~ '_battery_voltage') | float(-1) %}
+        {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+        {% set ns.g = ns.g + [states('sensor.solarassistant_inverter_' ~ n ~ '_grid_voltage') | float(0)] %}
+      {% endfor %}
+      {{ (ns.v | count) > 0 and (ns.v | min) < 48.8 and (ns.g | max) > 170
+         and not is_state('binary_sensor.netzbetrieb_aktiv', 'on') }}
+    for: "00:20:00"
+  - trigger: template
+    id: netzausfall
+    value_template: >-
+      {{ is_state('binary_sensor.solar_assistant_erreichbar', 'on')
+         and states('sensor.solarassistant_inverter_1_grid_voltage') | float(0) < 100
+         and states('sensor.solarassistant_inverter_2_grid_voltage') | float(0) < 100
+         and states('sensor.solarassistant_inverter_3_grid_voltage') | float(0) < 100 }}
+    for: "00:10:00"
+  - trigger: template
+    id: netz_zurueck
+    value_template: >-
+      {{ [states('sensor.solarassistant_inverter_1_grid_voltage') | float(0),
+          states('sensor.solarassistant_inverter_2_grid_voltage') | float(0),
+          states('sensor.solarassistant_inverter_3_grid_voltage') | float(0)] | max > 170 }}
+    for: "00:05:00"
+  - trigger: state
+    id: sa_offline
+    entity_id: binary_sensor.solar_assistant_erreichbar
+    to: "off"
+    for: "00:15:00"
+  - trigger: state
+    id: sa_online
+    entity_id: binary_sensor.solar_assistant_erreichbar
+    from: "off"
+    to: "on"
+    for: "00:05:00"
+  - trigger: state
+    id: sperre_haengt
+    entity_id: input_boolean.heizstab_sicherheits_sperre
+    to: "on"
+    for: "00:30:00"
+  - trigger: numeric_state
+    id: kessel_kalt
+    entity_id: sensor.sicherer_kessel_mitte
+    below: 15
+    for: "01:00:00"
+  - trigger: template
+    id: raum_kalt
+    value_template: >-
+      {{ states('sensor.shelly_blu_h_t_b414_temperatur') | float(99) < 8
+         or states('sensor.durchschnittstemperatur_og2') | float(99) < 8
+         or states('sensor.durchschnittstemperatur_og3') | float(99) < 8 }}
+    for: "00:30:00"
+  - trigger: state
+    id: notlauf_lang
+    entity_id: binary_sensor.heizstab_notlauf_aktiv
+    to: "on"
+    for: "24:00:00"
+  - trigger: state
+    id: ladequelle
+    entity_id:
+      - select.solarassistant_inverter_1_charger_source_priority
+      - select.solarassistant_inverter_2_charger_source_priority
+      - select.solarassistant_inverter_3_charger_source_priority
+  - trigger: homeassistant
+    id: ha_start
+    event: start
+variables:
+  tid: "{{ trigger.id | default('', true) | string }}"
+  bat_v: >-
+    {% set ns = namespace(v=[]) %}
+    {% for n in [1, 2, 3] %}
+      {% set x = states('sensor.solarassistant_inverter_' ~ n ~ '_battery_voltage') | float(-1) %}
+      {% if x > 0 %}{% set ns.v = ns.v + [x] %}{% endif %}
+    {% endfor %}
+    {{ (ns.v | min) if (ns.v | count) > 0 else -1 }}
+  netz_v: >-
+    {{ states('sensor.solarassistant_inverter_1_grid_voltage') | float(0) | round(0) }} /
+    {{ states('sensor.solarassistant_inverter_2_grid_voltage') | float(0) | round(0) }} /
+    {{ states('sensor.solarassistant_inverter_3_grid_voltage') | float(0) | round(0) }} V
+  # Beim HA-Start springen die select-Entitaeten von unknown auf ihren Wert -> das ist keine Aenderung.
+  skip: >-
+    {{ tid == 'ladequelle' and (
+         trigger.from_state is none or trigger.to_state is none
+         or trigger.from_state.state in ['unknown', 'unavailable']
+         or trigger.to_state.state in ['unknown', 'unavailable']) }}
+  titel: >-
+    {% if tid == 'akku_kritisch' %}AKKU KRITISCH
+    {% elif tid == 'netz_verweigert' %}WR NEHMEN DAS NETZ NICHT AN
+    {% elif tid == 'netzausfall' %}Netzausfall
+    {% elif tid == 'netz_zurueck' %}Netz wieder da
+    {% elif tid == 'sa_offline' %}Solar Assistant offline
+    {% elif tid == 'sa_online' %}Solar Assistant wieder da
+    {% elif tid == 'sperre_haengt' %}Heizstab-Sperre haengt
+    {% elif tid == 'kessel_kalt' %}Kessel kalt
+    {% elif tid == 'raum_kalt' %}FROSTGEFAHR Raum
+    {% elif tid == 'notlauf_lang' %}Notlauf seit 24 h
+    {% elif tid == 'ladequelle' %}Ladequelle geaendert
+    {% elif tid == 'ha_start' %}Home Assistant neu gestartet
+    {% else %}Hinweis{% endif %}
+  meldung: >-
+    {% set zeit = now().strftime('%d.%m. %H:%M') %}
+    {% set netzbetrieb = states('binary_sensor.netzbetrieb_aktiv') %}
+    {% set quelle = states('select.solarassistant_inverter_1_charger_source_priority') %}
+    {% if tid == 'akku_kritisch' %}
+      Akku {{ bat_v }} V, 10 min unter 48,0 V. Haus schaltet bei 47,0 V ab. Netzbetrieb: {{ netzbetrieb }},
+      Netz {{ netz_v }}, Ladequelle WR1: {{ quelle }}. Pruefen: Netz da? Notladung (09) gelaufen?
+      Notfalls in Solar Assistant die Ladequelle von Hand auf "Solar first" stellen.
+    {% elif tid == 'netz_verweigert' %}
+      Akku {{ bat_v }} V (20 min unter 48,8 V), Netz liegt an ({{ netz_v }}), aber kein WR ist im Netzbetrieb.
+      Das ist das Muster vom Fruehjahr (WR nahmen das Netz nicht an). Pruefen: WR-Modus in SA, F0-01 = GEN,
+      Sicherung/Bypass. Haus schaltet bei 47,0 V ab.
+    {% elif tid == 'netzausfall' %}
+      Alle drei WR messen seit 10 min unter 100 V am Netzeingang ({{ netz_v }}). Haus laeuft auf Akku
+      ({{ bat_v }} V). Kein Netz-Notlauf moeglich, bis das Netz zurueck ist.
+    {% elif tid == 'netz_zurueck' %}
+      Netzspannung wieder da ({{ netz_v }}). Akku {{ bat_v }} V.
+    {% elif tid == 'sa_offline' %}
+      Solar Assistant seit 15 min nicht erreichbar. Watchdog-Sperre aktiv, Heizstaebe aus, Pumpen laufen weiter.
+      Pruefen: SA-Geraet, Netzwerk, Strom im Technikraum.
+    {% elif tid == 'sa_online' %}
+      Solar Assistant wieder erreichbar, Watchdog-Sperre loest sich von selbst.
+    {% elif tid == 'sperre_haengt' %}
+      Sicherheits-Sperre seit 30 min an. Status: {{ states('sensor.heizstab_status_grund') }}. Netzbezug
+      {{ states('sensor.sichere_netz_leistung') | float(0) | round(0) }} W, Akku
+      {{ states('sensor.sichere_batterie_leistung') | float(0) | round(0) }} W. Entsperrt sich, sobald 2 min
+      alles ok ist; sonst Helfer "Heizstab Sicherheits Sperre" von Hand aus.
+    {% elif tid == 'kessel_kalt' %}
+      Kessel mitte {{ states('sensor.sicherer_kessel_mitte') }} C seit 1 h unter 15 C. Notlauf:
+      {{ states('binary_sensor.heizstab_notlauf_aktiv') }}, Netzbetrieb: {{ netzbetrieb }}, Status:
+      {{ states('sensor.heizstab_status_grund') }}. Pruefen: Staebe (Shelly), Sperren, Netz.
+    {% elif tid == 'raum_kalt' %}
+      Ein Stockwerk seit 30 min unter 8 C (EG {{ states('sensor.shelly_blu_h_t_b414_temperatur') }},
+      OG2 {{ states('sensor.durchschnittstemperatur_og2') }}, OG3 {{ states('sensor.durchschnittstemperatur_og3') }} C).
+      Pumpen: {{ states('switch.pumpen') }}, Kessel mitte {{ states('sensor.sicherer_kessel_mitte') }} C.
+    {% elif tid == 'notlauf_lang' %}
+      Notlauf laeuft seit 24 h ohne das Ziel zu erreichen. Kessel mitte {{ states('sensor.sicherer_kessel_mitte') }} C,
+      Status: {{ states('sensor.heizstab_status_grund') }}, Netzbetrieb: {{ netzbetrieb }}.
+    {% elif tid == 'ladequelle' %}
+      {{ trigger.entity_id }}: {{ trigger.from_state.state }} -> {{ trigger.to_state.state }}. Akku {{ bat_v }} V,
+      Netzbetrieb: {{ netzbetrieb }}. (Notladung 09 stellt bei < 48,5 V auf SOF und ab 51,5 V zurueck auf OSO.)
+    {% elif tid == 'ha_start' %}
+      HA ist neu gestartet (Stromausfall oder Neustart). Soll-Stufe steht auf 0, Aktorik schaltet in 50 s nach.
+    {% endif %}
+    {{ zeit }}
+actions:
+  - condition: template
+    value_template: "{{ not skip }}"
+  - action: persistent_notification.create
+    data:
+      notification_id: "alarm_{{ tid }}"
+      title: "{{ titel | trim }}"
+      message: "{{ meldung | trim }}"
+  # Push auf alle Handys mit Companion-App. Ohne App: diesen Schritt loeschen.
+  - action: notify.notify
+    continue_on_error: true
+    data:
+      title: "{{ titel | trim }}"
+      message: "{{ meldung | trim }}"
+mode: queued
+max: 10
